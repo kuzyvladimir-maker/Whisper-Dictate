@@ -1,0 +1,31 @@
+{
+  "title": "Whisper Dictate",
+  "rules": [
+    {
+      "description": "Whisper Dictate: Fn/Globe to F18",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "apple_vendor_top_case_key_code": "keyboard_fn",
+            "modifiers": {
+              "optional": [
+                "any"
+              ]
+            }
+          },
+          "to": [
+            {
+              "shell_command": "__CONTROL_SCRIPT__ press"
+            }
+          ],
+          "to_after_key_up": [
+            {
+              "shell_command": "__CONTROL_SCRIPT__ release"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

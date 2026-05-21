@@ -1,0 +1,11 @@
+{
+  "control_socket": "/tmp/whisper-dictate.sock",
+  "language": "ru",
+  "sample_rate": 16000,
+  "tap_threshold_seconds": 0.25,
+  "double_tap_window_seconds": 0.4,
+  "paste_after_transcription": true,
+  "smart_cleanup": true,
+  "initial_prompt": "",
+  "model_filename": "ggml-large-v3-turbo.bin"
+}
