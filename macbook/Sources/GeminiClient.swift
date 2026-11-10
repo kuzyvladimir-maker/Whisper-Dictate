@@ -117,6 +117,71 @@ final class GeminiClient {
         var attempts = 0
         var paused = false
         var lastError: GeminiError = .rateLimited
+        // Hedging: Gemini usually answers in ~1-1.5 s but has rare 4-8 s spikes. If the
+        // first request is still silent after `hedgeAfter`, a second one goes out on the
+        // cheap model with another key; the first good answer wins.
+        var inFlight = 0
+        var done = false
+        var hedgeScheduled = false
+        var busy: (model: String, idx: Int)?
+        var hedgeAfter: Double { 1.0 + audioSeconds * 0.02 }
+
+        func complete(_ result: Result<GeminiResult, GeminiError>) {
+            guard !done else { return }
+            done = true
+            completion(result)
+        }
+
+        /// A retryable failure: wait for a request still in flight, otherwise go on.
+        func retryOrWait() {
+            if inFlight > 0 { return }
+            next()
+        }
+
+        /// A fatal failure: only final if nothing else is still in flight.
+        func fail(_ error: GeminiError) {
+            lastError = error
+            if inFlight > 0 { return }
+            complete(.failure(error))
+        }
+
+        private func pick(from list: [String], avoidKey: Int?) -> (String, Int)? {
+            let c = client
+            let n = c.keys.count
+            let now = Date()
+            for model in list where !c.missingModels.contains(model) {
+                for off in 0..<n {
+                    let idx = (c.roundRobin + off) % n
+                    let id = "\(model)#\(idx)"
+                    if idx == avoidKey || tried.contains(id) { continue }
+                    if let until = c.keyBanned[idx], until > now { continue }
+                    if let until = c.cooldown[id], until > now { continue }
+                    return (model, idx)
+                }
+            }
+            return nil
+        }
+
+        private func launch(_ model: String, _ idx: Int) {
+            tried.insert("\(model)#\(idx)")
+            attempts += 1
+            busy = (model, idx)
+            client.send(model: model, keyIndex: idx, job: self)
+            if !hedgeScheduled {
+                hedgeScheduled = true
+                client.q.asyncAfter(deadline: .now() + hedgeAfter) { [self] in self.hedge() }
+            }
+        }
+
+        private func hedge() {
+            guard !done, inFlight == 1, let b = busy else { return }
+            // Hedge on the cheap model (flash-lite: 500/day free) — never burn the
+            // quality model's 20/day on a duplicate.
+            let cheap = models.first(where: { $0.contains("lite") })
+            guard let (model, idx) = (cheap.flatMap { pick(from: [$0], avoidKey: b.idx) }) else { return }
+            Log.write("gemini: no answer after \(fmt(hedgeAfter))s, hedging on \(model) key#\(idx + 1)")
+            launch(model, idx)
+        }
 
         init(client: GeminiClient, b64: String, mimeType: String, audioSeconds: Double, system: String, user: String,
              models: [String], completion: @escaping (Result<GeminiResult, GeminiError>) -> Void) {
@@ -131,21 +196,12 @@ final class GeminiClient {
         }
 
         func next() {
+            guard !done else { return }
             let c = client
-            let n = c.keys.count
             let now = Date()
-            for model in models where !c.missingModels.contains(model) {
-                for off in 0..<n {
-                    let idx = (c.roundRobin + off) % n
-                    let id = "\(model)#\(idx)"
-                    if tried.contains(id) { continue }
-                    if let until = c.keyBanned[idx], until > now { continue }
-                    if let until = c.cooldown[id], until > now { continue }
-                    tried.insert(id)
-                    attempts += 1
-                    c.send(model: model, keyIndex: idx, job: self)
-                    return
-                }
+            if let (model, idx) = pick(from: models, avoidKey: nil) {
+                launch(model, idx)
+                return
             }
             // Everything is cooling down. Wait once if a pair frees up soon.
             if !paused, let wait = c.soonestFree(models: models, now: now), wait <= 8 {
@@ -155,13 +211,13 @@ final class GeminiClient {
                 c.q.asyncAfter(deadline: .now() + wait + 0.1) { self.next() }
                 return
             }
-            completion(.failure(lastError))
+            complete(.failure(lastError))
         }
 
         func finish(text: String, model: String, keyIndex: Int) {
             client.roundRobin = (keyIndex + 1) % max(client.keys.count, 1)
-            completion(.success(GeminiResult(text: text, model: model, keyIndex: keyIndex, attempts: attempts,
-                                             seconds: Date().timeIntervalSince(started))))
+            complete(.success(GeminiResult(text: text, model: model, keyIndex: keyIndex, attempts: attempts,
+                                           seconds: Date().timeIntervalSince(started))))
         }
     }
 
@@ -210,9 +266,10 @@ final class GeminiClient {
     private func send(model: String, keyIndex: Int, job: Job) {
         guard let url = URL(string: "\(host)/v1beta/models/\(model):generateContent"),
               let payload = body(model: model, job: job) else {
-            job.completion(.failure(.http(0, "bad request")))
+            job.fail(.http(0, "bad request"))
             return
         }
+        job.inFlight += 1
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -232,15 +289,17 @@ final class GeminiClient {
     private func handle(model: String, keyIndex: Int, job: Job, data: Data?, response: HTTPURLResponse?,
                         error: Error?, seconds: Double) {
         let tag = "\(model) key#\(keyIndex + 1)"
+        job.inFlight -= 1
+        if job.done { return }   // the other (hedged) request already won
         if let error = error {
             let code = (error as NSError).code
             Log.write("gemini \(tag): network error \(code) after \(fmt(seconds))s")
             // A stale pooled connection dies with "connection lost": just try the next pair.
             if code == NSURLErrorNetworkConnectionLost {
                 job.lastError = .network(error.localizedDescription)
-                job.next()
+                job.retryOrWait()
             } else {
-                job.completion(.failure(.network(error.localizedDescription)))
+                job.fail(.network(error.localizedDescription))
             }
             return
         }
@@ -255,7 +314,7 @@ final class GeminiClient {
             Log.write("gemini \(tag): 200 in \(fmt(seconds))s, \(text.count) chars, finish=\(finish ?? "-")")
             if text.isEmpty, let reason = blockReason ?? (finish == "STOP" || finish == nil ? nil : finish) {
                 job.lastError = .blocked(reason)
-                job.next()
+                job.retryOrWait()
                 return
             }
             job.finish(text: text, model: model, keyIndex: keyIndex)
@@ -266,30 +325,30 @@ final class GeminiClient {
             cooldown["\(model)#\(keyIndex)"] = Date().addingTimeInterval(cool)
             Log.write("gemini \(tag): 429, cooldown \(Int(cool))s\(perDay ? " (daily quota)" : "")")
             job.lastError = .rateLimited
-            job.next()
+            job.retryOrWait()
         case 400 where message.lowercased().contains("thinking") && !noThinkingConfig.contains(model):
             noThinkingConfig.insert(model)
             job.tried.remove("\(model)#\(keyIndex)")
             Log.write("gemini \(tag): thinking config rejected, retrying without it")
-            job.next()
+            job.retryOrWait()
         case let code where code == 404 || ((code == 400 || code == 403) && GeminiClient.modelUnavailable(message)):
             missingModels.insert(model)
             Log.write("gemini \(model): unavailable (\(status) \(message.prefix(100))), next model")
             job.lastError = .http(status, message)
-            job.next()
+            job.retryOrWait()
         case 400 where message.contains("API key") || message.contains("API_KEY"),
              401, 403:
             keyBanned[keyIndex] = Date().addingTimeInterval(6 * 3600)
             Log.write("gemini key#\(keyIndex + 1): rejected (\(status)), disabled for 6h")
             job.lastError = .badKeys
-            job.next()
+            job.retryOrWait()
         case 500...599:
             Log.write("gemini \(tag): \(status) \(message.prefix(120))")
             job.lastError = .http(status, message)
-            job.next()
+            job.retryOrWait()
         default:
             Log.write("gemini \(tag): \(status) \(message.prefix(200))")
-            job.completion(.failure(.http(status, message)))
+            job.fail(.http(status, message))
         }
     }
 
