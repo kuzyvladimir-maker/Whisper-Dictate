@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var state: State = .idle
     private var session = 0
     private var pressedAt = Date()
+    private var processingSince = Date()
     private var dictionary: [DictEntry] = []
     private var statusItem: NSStatusItem!
     private var tick: Timer?
@@ -122,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             cancelRecording(silent: false)
             return true
         }
-        if state == .processing {
+        if state == .processing && Date().timeIntervalSince(processingSince) > 2.5 {
             session += 1
             state = .idle
             failedAudio = pendingAudio
@@ -219,6 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         state = .processing
+        processingSince = Date()
         pendingAudio = samples
         updateIcon()
         let token = session
@@ -237,8 +239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let system = Prompts.system(mode: mode, dictionary: dictionary)
-        gemini.transcribe(wav: Audio.wav(samples), audioSeconds: seconds, system: system, user: Prompts.user,
-                          models: settings.models) { result in
+        let upload = Audio.encodeForUpload(samples, format: settings.audioFormat)
+        gemini.transcribe(audio: upload.data, mimeType: upload.mime, audioSeconds: seconds, system: system,
+                          user: Prompts.user, models: settings.models) { result in
             DispatchQueue.main.async {
                 guard token == self.session, self.state == .processing else { return }
                 switch result {

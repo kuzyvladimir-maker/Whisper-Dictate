@@ -42,7 +42,10 @@ enum HotkeyChoice: String, CaseIterable {
 }
 
 enum Paths {
-    static let home = FileManager.default.homeDirectoryForCurrentUser
+    static let home: URL = {
+        if let h = ProcessInfo.processInfo.environment["HOME"], !h.isEmpty { return URL(fileURLWithPath: h, isDirectory: true) }
+        return FileManager.default.homeDirectoryForCurrentUser
+    }()
     static let configDir = home.appendingPathComponent(".config/whisper-dictate", isDirectory: true)
     static let envFile = configDir.appendingPathComponent("env")
     static let settingsFile = configDir.appendingPathComponent("lite.json")
@@ -67,6 +70,7 @@ final class Settings {
     var model = "gemini-2.5-flash"
     var fallbackModels = ["gemini-2.5-flash-lite"]
     var language = "ru"
+    var audioFormat = "aac"   // "aac" (smaller upload) or "wav"
     var whisperCli = ""
     var whisperModel = ""
 
@@ -94,6 +98,7 @@ final class Settings {
         if let v = obj["model"] as? String, !v.isEmpty { model = v }
         if let v = obj["fallback_models"] as? [String] { fallbackModels = v }
         if let v = obj["language"] as? String, !v.isEmpty { language = v }
+        if let v = obj["audio_format"] as? String, v == "aac" || v == "wav" { audioFormat = v }
         if let v = obj["whisper_cli"] as? String { whisperCli = v }
         if let v = obj["whisper_model"] as? String { whisperModel = v }
     }
@@ -113,6 +118,7 @@ final class Settings {
             "model": model,
             "fallback_models": fallbackModels,
             "language": language,
+            "audio_format": audioFormat,
             "whisper_cli": whisperCli,
             "whisper_model": whisperModel,
         ]

@@ -88,14 +88,14 @@ final class GeminiClient {
         session.dataTask(with: req).resume()
     }
 
-    func transcribe(wav: Data, audioSeconds: Double, system: String, user: String, models: [String],
+    func transcribe(audio: Data, mimeType: String, audioSeconds: Double, system: String, user: String, models: [String],
                     completion: @escaping (Result<GeminiResult, GeminiError>) -> Void) {
         q.async {
             if self.keys.isEmpty {
                 completion(.failure(.noKeys))
                 return
             }
-            let job = Job(client: self, b64: wav.base64EncodedString(), audioSeconds: audioSeconds,
+            let job = Job(client: self, b64: audio.base64EncodedString(), mimeType: mimeType, audioSeconds: audioSeconds,
                           system: system, user: user, models: models, completion: completion)
             job.next()
         }
@@ -106,6 +106,7 @@ final class GeminiClient {
     private final class Job {
         let client: GeminiClient
         let b64: String
+        let mimeType: String
         let audioSeconds: Double
         let system: String
         let user: String
@@ -117,10 +118,11 @@ final class GeminiClient {
         var paused = false
         var lastError: GeminiError = .rateLimited
 
-        init(client: GeminiClient, b64: String, audioSeconds: Double, system: String, user: String,
+        init(client: GeminiClient, b64: String, mimeType: String, audioSeconds: Double, system: String, user: String,
              models: [String], completion: @escaping (Result<GeminiResult, GeminiError>) -> Void) {
             self.client = client
             self.b64 = b64
+            self.mimeType = mimeType
             self.audioSeconds = audioSeconds
             self.system = system
             self.user = user
@@ -195,7 +197,7 @@ final class GeminiClient {
             "contents": [[
                 "role": "user",
                 "parts": [
-                    ["inlineData": ["mimeType": "audio/wav", "data": job.b64]],
+                    ["inlineData": ["mimeType": job.mimeType, "data": job.b64]],
                     ["text": job.user],
                 ],
             ]],

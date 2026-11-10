@@ -154,4 +154,74 @@ enum Audio {
         }
         return d
     }
+
+    /// Upload encoding for Gemini: AAC when requested and the encoder works, WAV otherwise.
+    static func encodeForUpload(_ samples: [Int16], format: String) -> (data: Data, mime: String) {
+        if format == "aac", let d = aac(samples) { return (d, "audio/aac") }
+        return (wav(samples), "audio/wav")
+    }
+
+    /// AAC-LC in ADTS framing ("audio/aac"), encoded in memory. About 8x smaller than WAV,
+    /// which matters for upload time on long dictations. Returns nil if the encoder refuses.
+    static func aac(_ samples: [Int16], bitRate: Int = 32000) -> Data? {
+        guard !samples.isEmpty else { return nil }
+        var desc = AudioStreamBasicDescription(mSampleRate: Recorder.sampleRate, mFormatID: kAudioFormatMPEG4AAC,
+                                               mFormatFlags: 0, mBytesPerPacket: 0, mFramesPerPacket: 1024,
+                                               mBytesPerFrame: 0, mChannelsPerFrame: 1, mBitsPerChannel: 0,
+                                               mReserved: 0)
+        guard let outFormat = AVAudioFormat(streamDescription: &desc),
+              let conv = AVAudioConverter(from: Recorder.targetFormat, to: outFormat),
+              let input = AVAudioPCMBuffer(pcmFormat: Recorder.targetFormat,
+                                           frameCapacity: AVAudioFrameCount(samples.count)),
+              let dst = input.int16ChannelData else { return nil }
+        if let rates = conv.applicableEncodeBitRates?.map({ $0.intValue }), !rates.isEmpty {
+            conv.bitRate = rates.min(by: { abs($0 - bitRate) < abs($1 - bitRate) })!
+        }
+        input.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { src in
+            _ = memcpy(dst[0], src.baseAddress!, samples.count * 2)
+        }
+        let maxPacket = max(conv.maximumOutputPacketSize, 2048)
+        var out = Data(capacity: samples.count / 4)
+        var fed = false
+        while true {
+            let buf = AVAudioCompressedBuffer(format: outFormat, packetCapacity: 64, maximumPacketSize: maxPacket)
+            var error: NSError?
+            let status = conv.convert(to: buf, error: &error) { _, inputStatus in
+                if fed {
+                    inputStatus.pointee = .endOfStream
+                    return nil
+                }
+                fed = true
+                inputStatus.pointee = .haveData
+                return input
+            }
+            if status == .error { return nil }
+            if let descs = buf.packetDescriptions {
+                for i in 0..<Int(buf.packetCount) {
+                    let size = Int(descs[i].mDataByteSize)
+                    out.append(contentsOf: adtsHeader(payload: size))
+                    out.append(buf.data.advanced(by: Int(descs[i].mStartOffset)).assumingMemoryBound(to: UInt8.self),
+                               count: size)
+                }
+            }
+            if status == .endOfStream || buf.packetCount == 0 { break }
+        }
+        return out.isEmpty ? nil : out
+    }
+
+    private static func adtsHeader(payload: Int) -> [UInt8] {
+        let length = payload + 7
+        let profile: UInt8 = 1        // AAC LC (object type 2) - 1
+        let freqIndex: UInt8 = 8      // 16000 Hz
+        let channels: UInt8 = 1
+        return [
+            0xFF, 0xF1,
+            (profile << 6) | (freqIndex << 2) | (channels >> 2),
+            ((channels & 3) << 6) | UInt8((length >> 11) & 0x03),
+            UInt8((length >> 3) & 0xFF),
+            UInt8((length & 0x07) << 5) | 0x1F,
+            0xFC,
+        ]
+    }
 }

@@ -1,7 +1,8 @@
 import Cocoa
 
 // Command-line entry points (no menu bar):
-//   --bench [--model M] [--mode normal|email|code] [--cold] file...   latency + text per file
+//   --bench [--model M] [--mode normal|email|code] [--format aac|wav] [--cold] file...
+//   --bench --local file...     same through whisper.cpp
 //   --list-models                                                     models available to the key
 //   --selftest                                                        offline checks
 // The bench runs the same GeminiClient the app uses. Without --cold it warms the connection
@@ -13,6 +14,8 @@ enum CLI {
         var models: [String] = []
         var mode = DictationMode.normal
         var cold = false
+        var useLocal = false
+        var format = Settings.shared.audioFormat
         var command = ""
         var i = 0
         while i < args.count {
@@ -26,6 +29,10 @@ enum CLI {
                 i += 1
                 if i < args.count, let m = DictationMode(rawValue: args[i]) { mode = m }
             case "--cold": cold = true
+            case "--local": useLocal = true
+            case "--format":
+                i += 1
+                if i < args.count { format = args[i] }
             default: files.append(a)
             }
             i += 1
@@ -33,7 +40,8 @@ enum CLI {
         switch command {
         case "--selftest": return selftest()
         case "--list-models": return listModels()
-        case "--bench": return bench(files: files, models: models, mode: mode, cold: cold)
+        case "--bench" where useLocal: return benchLocal(files: files)
+        case "--bench": return bench(files: files, models: models, mode: mode, cold: cold, format: format)
         default:
             print("usage: WhisperDictateLite --bench [--model M] [--mode normal|email|code] [--cold] file...")
             print("       WhisperDictateLite --list-models | --selftest")
@@ -63,11 +71,12 @@ enum CLI {
         return 0
     }
 
-    private static func bench(files: [String], models: [String], mode: DictationMode, cold: Bool) -> Int32 {
+    private static func bench(files: [String], models: [String], mode: DictationMode, cold: Bool,
+                              format: String) -> Int32 {
         guard let c = client() else { return 2 }
         let chain = models.isEmpty ? Settings.shared.models : models
         let system = Prompts.system(mode: mode, dictionary: UserDictionary.load())
-        print("arch=\(machineArch()) keys=\(c.keyCount) models=\(chain.joined(separator: ",")) mode=\(mode.rawValue) warm=\(!cold)")
+        print("arch=\(machineArch()) keys=\(c.keyCount) models=\(chain.joined(separator: ",")) mode=\(mode.rawValue) format=\(format) warm=\(!cold)")
         var totals: [Double] = []
         for path in files {
             let url = URL(fileURLWithPath: path)
@@ -81,20 +90,21 @@ enum CLI {
                 c.warmUp()
                 Thread.sleep(forTimeInterval: 1.0)
             }
-            // Timed from "key release": WAV encoding + request + cleanup, as in the app.
+            // Timed from "key release": encoding + request + cleanup, as in the app.
             let t0 = Date()
-            let wav = Audio.wav(samples)
+            let upload = Audio.encodeForUpload(samples, format: format)
             let done = DispatchSemaphore(value: 0)
             var line = ""
             var text = ""
-            c.transcribe(wav: wav, audioSeconds: seconds, system: system, user: Prompts.user, models: chain) { r in
+            c.transcribe(audio: upload.data, mimeType: upload.mime, audioSeconds: seconds, system: system,
+                         user: Prompts.user, models: chain) { r in
                 let dt = Date().timeIntervalSince(t0)
                 switch r {
                 case .success(let res):
                     text = Prompts.clean(res.text, mode: mode)
                     totals.append(dt)
-                    line = String(format: "%@\taudio %.1fs\twav %dKB\t→ %.2fs\t%@ key#%d tries=%d",
-                                  url.lastPathComponent, seconds, wav.count / 1024, dt, res.model,
+                    line = String(format: "%@\taudio %.1fs\t%@ %dKB\t→ %.2fs\t%@ key#%d tries=%d",
+                                  url.lastPathComponent, seconds, upload.mime, upload.data.count / 1024, dt, res.model,
                                   res.keyIndex + 1, res.attempts)
                 case .failure(let e):
                     line = String(format: "%@\taudio %.1fs\tFAILED after %.2fs: %@", url.lastPathComponent,
@@ -110,6 +120,36 @@ enum CLI {
             let sorted = totals.sorted()
             print(String(format: "release→text: median %.2fs, min %.2fs, max %.2fs (n=%d)",
                          sorted[sorted.count / 2], sorted.first!, sorted.last!, sorted.count))
+        }
+        return 0
+    }
+
+    private static func benchLocal(files: [String]) -> Int32 {
+        let local = LocalWhisper()
+        guard let found = local.locate() else {
+            print(LocalWhisperError.notInstalled.localizedDescription)
+            return 2
+        }
+        print("arch=\(machineArch()) whisper.cpp=\(found.cli) model=\((found.model as NSString).lastPathComponent)")
+        let hint = Prompts.whisperHint(dictionary: UserDictionary.load())
+        for path in files {
+            let url = URL(fileURLWithPath: path)
+            guard let samples = try? Audio.load(url) else { continue }
+            let t0 = Date()
+            let done = DispatchSemaphore(value: 0)
+            var line = ""
+            local.transcribe(samples: samples, language: Settings.shared.language, hint: hint) { r in
+                switch r {
+                case .success(let text):
+                    line = String(format: "%@\taudio %.1fs\t→ %.2fs\n   %@", url.lastPathComponent,
+                                  Double(samples.count) / Recorder.sampleRate, Date().timeIntervalSince(t0), text)
+                case .failure(let e):
+                    line = "\(url.lastPathComponent)\tFAILED: \(e.localizedDescription)"
+                }
+                done.signal()
+            }
+            done.wait()
+            print(line)
         }
         return 0
     }
@@ -131,6 +171,16 @@ enum CLI {
             check("wav round trip", abs(back.count - tone.count) < 64, "\(back.count) samples")
         } else {
             check("wav round trip", false)
+        }
+
+        if let aac = Audio.aac(tone) {
+            let aacFile = FileManager.default.temporaryDirectory.appendingPathComponent("wdl-selftest-\(UUID().uuidString).aac")
+            defer { try? FileManager.default.removeItem(at: aacFile) }
+            let decoded = (try? aac.write(to: aacFile)).flatMap { _ in try? Audio.load(aacFile) } ?? []
+            check("aac encode/decode", decoded.count > 15000 && decoded.count < 20000,
+                  "\(aac.count) bytes vs wav \(wav.count), decoded \(decoded.count) samples")
+        } else {
+            check("aac encode", false)
         }
 
         let dict = UserDictionary.parse("# c\nSalutem\nVeeqo = вику, вико\n\nStill Frozen # brand\n")
