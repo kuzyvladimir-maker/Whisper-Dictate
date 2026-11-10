@@ -4,8 +4,11 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$APP_DIR/.venv"
 WHISPER_DIR="$APP_DIR/vendor/whisper.cpp"
+WHISPER_COMMIT="${WHISPER_CPP_COMMIT:-3e9b7d0fef3528ee2208da3cdb873a2c53d2ae2f}"
 MODEL_NAME="${WHISPER_MODEL:-large-v3-turbo}"
 MODEL_FILE="$WHISPER_DIR/models/ggml-$MODEL_NAME.bin"
+DEFAULT_MODEL_SHA256="1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+VAD_SHA256="2aa269b785eeb53a82983a20501ddf7c1d9c48e33ab63a41391ac6c9f7fb6987"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.whisperdictate.app.plist"
 KARABINER_RULES_DIR="$HOME/.config/karabiner/assets/complex_modifications"
 DATA_DIR="$HOME/Library/Application Support/Whisper Dictate"
@@ -48,8 +51,10 @@ build_whisper_cpp() {
 
   if [ ! -d "$WHISPER_DIR/.git" ]; then
     rm -rf "$WHISPER_DIR"
-    git clone --depth 1 https://github.com/ggml-org/whisper.cpp.git "$WHISPER_DIR"
+    git clone --no-checkout https://github.com/ggml-org/whisper.cpp.git "$WHISPER_DIR"
   fi
+  git -C "$WHISPER_DIR" fetch --depth 1 origin "$WHISPER_COMMIT"
+  git -C "$WHISPER_DIR" checkout --detach FETCH_HEAD
 
   local cmake_args=(-S "$WHISPER_DIR" -B "$WHISPER_DIR/build" -DCMAKE_BUILD_TYPE=Release)
   if [ "$ARCH" = "arm64" ]; then
@@ -61,15 +66,41 @@ build_whisper_cpp() {
 
 download_model() {
   mkdir -p "$WHISPER_DIR/models"
-  if [ -f "$MODEL_FILE" ]; then
-    info "Model already exists: $MODEL_FILE"
+  if [ ! -f "$MODEL_FILE" ]; then
+    info "Downloading Whisper model: $MODEL_NAME"
+    if [ -x "$WHISPER_DIR/models/download-ggml-model.sh" ]; then
+      (cd "$WHISPER_DIR" && ./models/download-ggml-model.sh "$MODEL_NAME")
+    else
+      curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$MODEL_NAME.bin" -o "$MODEL_FILE"
+    fi
+  fi
+  local expected="${WHISPER_MODEL_SHA256:-}"
+  if [ "$MODEL_NAME" = "large-v3-turbo" ] && [ -z "$expected" ]; then
+    expected="$DEFAULT_MODEL_SHA256"
+  fi
+  verify_sha256 "$MODEL_FILE" "$expected"
+}
+
+download_vad_model() {
+  local vad_file="$WHISPER_DIR/models/ggml-silero-v6.2.0.bin"
+  if [ ! -f "$vad_file" ]; then
+    "$WHISPER_DIR/models/download-vad-model.sh" silero-v6.2.0
+  fi
+  verify_sha256 "$vad_file" "$VAD_SHA256"
+}
+
+verify_sha256() {
+  local path="$1"
+  local expected="$2"
+  if [ -z "$expected" ]; then
+    info "Warning: no SHA-256 configured for $path"
     return
   fi
-  info "Downloading Whisper model: $MODEL_NAME"
-  if [ -x "$WHISPER_DIR/models/download-ggml-model.sh" ]; then
-    (cd "$WHISPER_DIR" && ./models/download-ggml-model.sh "$MODEL_NAME")
-  else
-    curl -L "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$MODEL_NAME.bin" -o "$MODEL_FILE"
+  local actual
+  actual=$(shasum -a 256 "$path" | awk '{print $1}')
+  if [ "$actual" != "$expected" ]; then
+    info "SHA-256 mismatch for $path"
+    exit 1
   fi
 }
 
@@ -85,6 +116,9 @@ install_karabiner_rule() {
 
 install_launch_agent() {
   mkdir -p "$DATA_DIR/recordings"
+  chmod 700 "$DATA_DIR" "$DATA_DIR/recordings"
+  touch "$APP_DIR/whisper-dictate.err.log" "$APP_DIR/whisper-dictate.out.log"
+  chmod 600 "$APP_DIR/whisper-dictate.err.log" "$APP_DIR/whisper-dictate.out.log"
   mkdir -p "$HOME/Library/LaunchAgents"
   cat > "$PLIST_PATH" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -118,6 +152,7 @@ main() {
   install_python_deps
   build_whisper_cpp
   download_model
+  download_vad_model
   install_karabiner_rule
   bash "$APP_DIR/build_app.sh"
   install_launch_agent

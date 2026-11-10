@@ -5,17 +5,19 @@ APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR"
 
 ARCH="${ARCH:-$(uname -m)}"
+DIST_ROOT="${DIST_ROOT:-}"
+BUILD_ROOT="${BUILD_ROOT:-build-$ARCH}"
 case "$ARCH" in
   arm64)
     VENV=".venv"
     WHISPER_BUILD="vendor/whisper.cpp/build"
-    OUT_BUNDLE="dist/Whisper Dictate.app"
+    OUT_BUNDLE="${DIST_ROOT:-dist}/Whisper Dictate.app"
     ARCH_PREFIX=""
     ;;
   x86_64)
     VENV=".venv-x86"
     WHISPER_BUILD="vendor/whisper.cpp/build-x86"
-    OUT_BUNDLE="dist-x86/Whisper Dictate.app"
+    OUT_BUNDLE="${DIST_ROOT:-dist-x86}/Whisper Dictate.app"
     ARCH_PREFIX="arch -x86_64"
     ;;
   *)
@@ -34,8 +36,9 @@ if [ ! -x "$WHISPER_BIN" ]; then
 fi
 
 echo "Building Whisper Dictate.app for $ARCH..."
-$ARCH_PREFIX "$VENV/bin/python" -m pip install --upgrade pyinstaller >/dev/null
-rm -rf "build-$ARCH" "$BUNDLE_PARENT"
+$ARCH_PREFIX "$VENV/bin/python" -m pip install --upgrade "pyinstaller==6.20.0" >/dev/null
+rm -rf "$BUILD_ROOT" "$BUNDLE_PARENT"
+mkdir -p "$BUILD_ROOT"
 
 $ARCH_PREFIX "$VENV/bin/pyinstaller" \
   --noconfirm \
@@ -43,7 +46,8 @@ $ARCH_PREFIX "$VENV/bin/pyinstaller" \
   --name "Whisper Dictate" \
   --osx-bundle-identifier "com.whisperdictate.app" \
   --distpath "$BUNDLE_PARENT" \
-  --workpath "build-$ARCH" \
+  --workpath "$BUILD_ROOT" \
+  --specpath "$BUILD_ROOT" \
   --target-arch "$ARCH" \
   main.py
 
@@ -78,12 +82,29 @@ else
   echo "Warning: model not found at $MODEL_SRC. Bundle will not include it."
 fi
 
+VAD_MODEL_SRC="vendor/whisper.cpp/models/ggml-silero-v6.2.0.bin"
+if [ -f "$VAD_MODEL_SRC" ]; then
+  mkdir -p "$RESOURCES/models"
+  cp "$VAD_MODEL_SRC" "$RESOURCES/models/"
+else
+  echo "Warning: VAD model not found at $VAD_MODEL_SRC. VAD will be disabled."
+fi
+
 PLIST="$OUT_BUNDLE/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$PLIST" 2>/dev/null || \
   /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST"
 /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string Whisper Dictate records your voice locally for transcription." "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Whisper Dictate pastes transcribed text into the active app." "$PLIST" 2>/dev/null || true
 
-codesign --force --deep --sign - "$OUT_BUNDLE"
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+  codesign --force --deep --sign - "$OUT_BUNDLE"
+else
+  codesign --force --deep --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$OUT_BUNDLE"
+fi
 
-echo "Built: $APP_DIR/$OUT_BUNDLE"
+if [[ "$OUT_BUNDLE" = /* ]]; then
+  echo "Built: $OUT_BUNDLE"
+else
+  echo "Built: $APP_DIR/$OUT_BUNDLE"
+fi

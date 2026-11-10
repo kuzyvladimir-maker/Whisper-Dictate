@@ -35,16 +35,39 @@ bash build_pkg.sh
 ```
 
 Outputs `dist/WhisperDictate-x.y.z.pkg` (~1.4 GB, includes the model).
+For public distribution, set `CODESIGN_IDENTITY`, `INSTALLER_IDENTITY`, and
+optionally `NOTARY_PROFILE` (an `xcrun notarytool` keychain profile) to produce a
+Developer ID-signed and notarized package. Without them, the build remains an
+ad-hoc personal build and Gatekeeper will warn.
 
 ## Configuration
 
 User config lives at `~/Library/Application Support/Whisper Dictate/config.json` (auto-created on first toggle from the menu). Bundle default is at `Contents/Resources/config.json`.
+Source checkouts keep overrides in the ignored `config.local.json`, leaving the
+tracked `config.json` as the reproducible default.
 
 - `language` — `auto`, `en`, `ru`, etc.
 - `paste_after_transcription` — auto-paste or copy-only.
 - `tap_threshold_seconds`, `double_tap_window_seconds` — tap/hold timing.
 - `initial_prompt` — Whisper prompt to bias style.
 - `model_filename` — to swap models, drop a different `ggml-*.bin` into `Contents/Resources/models/` and update this field.
+- `persistent_server` — keep one model-loaded worker for lower latency.
+- `vad`, `vad_min_duration_seconds` — use Silero VAD only for longer recordings.
+- `keep_recordings`, `keep_transcripts` — local retention limits (`0` keeps everything).
+
+The global correction dictionary is `dictionary.txt`. Per-application dictionaries
+live in `dictionaries/<bundle-id>.txt`; use the menu-bar command to create one for
+the last application where dictation was started.
+
+## Development checks
+
+```bash
+python -m pip install -r requirements-dev.txt
+bash check.sh
+```
+
+This runs syntax checks and the regression suite for recording failures, hotkey
+timing, transcription cleanup, VAD routing, inference fallback, and dictionaries.
 
 ## Where things live
 
@@ -59,7 +82,7 @@ User config lives at `~/Library/Application Support/Whisper Dictate/config.json`
 | Question | Answer |
 |---|---|
 | Internet required? | Only at install time, to download the model and Karabiner-Elements. Dictation itself is fully offline. |
-| Max length? | No practical limit. whisper.cpp processes any duration; 5+ minute dictations work fine. |
+| Max length? | 10 minutes by default (`max_recording_seconds`); set it to `0` for no automatic stop. |
 | Cost? | Free. MIT-licensed code, free models, no cloud calls. |
 | Privacy? | Audio never leaves your machine. |
 

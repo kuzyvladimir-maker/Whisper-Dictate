@@ -30,3 +30,18 @@ vendor/python-x86/
 # macOS
 .DS_Store
 .claude/settings.local.json
+
+# Personal data and secrets: never commit (public repository)
+recordings/
+transcripts*
+*.jsonl
+.env
+.env.*
+.secrets/
+*.pem
+*.p12
+*.key
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/

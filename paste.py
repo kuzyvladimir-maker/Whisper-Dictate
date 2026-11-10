@@ -36,3 +36,26 @@ def notify(title: str, message: str) -> None:
 
     script = f"display notification {quote(message)} with title {quote(title)}"
     subprocess.run(["osascript", "-e", script], check=False)
+
+
+_SOUNDS = {
+    "start": "/System/Library/Sounds/Ping.aiff",   # запись началась
+    "stop": "/System/Library/Sounds/Pop.aiff",     # запись остановлена (отпустил)
+    "done": "/System/Library/Sounds/Glass.aiff",   # текст расшифрован и вставлен
+    "error": "/System/Library/Sounds/Basso.aiff",  # что-то пошло не так
+}
+
+
+def play_sound(name: str) -> None:
+    """Fire-and-forget audible cue. Never blocks, never raises."""
+    path = _SOUNDS.get(name)
+    if not path:
+        return
+    try:
+        subprocess.Popen(
+            ["afplay", "-v", "2", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass

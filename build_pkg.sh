@@ -24,6 +24,10 @@ case "$ARCH" in
 esac
 
 PKG_OUT="$OUT_DIR/WhisperDictate-${VERSION}-${ARCH}.pkg"
+PKG_BUILD_OUT="$PKG_OUT"
+if [ -n "${INSTALLER_IDENTITY:-}" ]; then
+  PKG_BUILD_OUT="$OUT_DIR/.WhisperDictate-${VERSION}-${ARCH}-unsigned.pkg"
+fi
 STAGING="$OUT_DIR/pkg-staging"
 SCRIPTS="$OUT_DIR/pkg-scripts"
 
@@ -56,6 +60,11 @@ run_as_user() {
 
 mkdir -p "$DATA_DIR/recordings"
 chown -R "$CONSOLE_USER:staff" "$DATA_DIR"
+chmod 700 "$DATA_DIR" "$DATA_DIR/recordings"
+touch "$DATA_DIR/whisper-dictate.err.log" "$DATA_DIR/whisper-dictate.out.log"
+chown "$CONSOLE_USER:staff" "$DATA_DIR/whisper-dictate.err.log" "$DATA_DIR/whisper-dictate.out.log"
+chmod 600 "$DATA_DIR/whisper-dictate.err.log" "$DATA_DIR/whisper-dictate.out.log"
+find "$DATA_DIR/recordings" -type f -name '*.wav' -exec chmod 600 {} +
 
 mkdir -p "$(dirname "$LAUNCH_AGENT")"
 cat > "$LAUNCH_AGENT" <<PLIST
@@ -109,7 +118,17 @@ echo "Building $PKG_OUT..."
   --version "$VERSION" \
   --install-location "/" \
   --scripts "$SCRIPTS" \
-  "$PKG_OUT"
+  "$PKG_BUILD_OUT"
+
+if [ -n "${INSTALLER_IDENTITY:-}" ]; then
+  /usr/bin/productsign --sign "$INSTALLER_IDENTITY" "$PKG_BUILD_OUT" "$PKG_OUT"
+  rm -f "$PKG_BUILD_OUT"
+fi
+
+if [ -n "${NOTARY_PROFILE:-}" ]; then
+  /usr/bin/xcrun notarytool submit "$PKG_OUT" --keychain-profile "$NOTARY_PROFILE" --wait
+  /usr/bin/xcrun stapler staple "$PKG_OUT"
+fi
 
 rm -rf "$STAGING" "$SCRIPTS"
 
