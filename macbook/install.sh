@@ -10,6 +10,7 @@
 # Что делает: собирает приложение из исходников (нужны Xcode Command Line Tools),
 # кладёт его в ~/Applications, включает автозапуск, создаёт ~/.config/whisper-dictate/.
 # Ключи Gemini сам не трогает: их кладут в ~/.config/whisper-dictate/env.
+# WDL_NO_LAUNCH=1 — тестовый прогон: без автозапуска и без изменения системных настроек.
 
 set -euo pipefail
 
@@ -100,7 +101,7 @@ ENV
   # 7. Fn — клавиша диктовки: убираем системное действие Fn/🌐 (смена раскладки, эмодзи),
   #    иначе оно срабатывает на каждое отпускание. Вернуть: Настройки → Клавиатура.
   local fn_note=""
-  if [ "$(defaults read com.apple.HIToolbox AppleFnUsageType 2>/dev/null || echo unset)" != "0" ]; then
+  if [ -z "${WDL_NO_LAUNCH:-}" ] && [ "$(defaults read com.apple.HIToolbox AppleFnUsageType 2>/dev/null || echo unset)" != "0" ]; then
     defaults write com.apple.HIToolbox AppleFnUsageType -int 0
     fn_note="Системное действие клавиши Fn/🌐 выключено («Ничего не делать»), чтобы Fn работала для диктовки."
   fi
