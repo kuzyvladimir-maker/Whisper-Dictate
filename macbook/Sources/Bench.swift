@@ -22,7 +22,7 @@ enum CLI {
         while i < args.count {
             let a = args[i]
             switch a {
-            case "--bench", "--list-models", "--selftest": command = a
+            case "--bench", "--list-models", "--selftest", "--mic-test": command = a
             case "--model":
                 i += 1
                 if i < args.count { models.append(args[i]) }
@@ -40,6 +40,7 @@ enum CLI {
         }
         switch command {
         case "--selftest": return selftest()
+        case "--mic-test": return micTest()
         case "--list-models": return listModels()
         case "--bench" where useLocal: return benchLocal(files: files)
         case "--bench": return bench(files: files, models: models, mode: mode, cold: cold, format: format)
@@ -75,7 +76,8 @@ enum CLI {
     private static func bench(files: [String], models: [String], mode: DictationMode, cold: Bool,
                               format: String) -> Int32 {
         guard let c = client() else { return 2 }
-        let system = Prompts.system(mode: mode, dictionary: UserDictionary.load())
+        UserDictionary.shared.refresh()
+        let system = Prompts.system(mode: mode, dictionary: UserDictionary.shared.entries(for: nil))
         let route = models.isEmpty ? "auto (\(Settings.shared.fastModel) < \(Int(Settings.shared.longAudioSeconds))s ≤ \(Settings.shared.model))" : models.joined(separator: ",")
         print("arch=\(machineArch()) keys=\(c.keyCount) models=\(route) mode=\(mode.rawValue) format=\(format) warm=\(!cold)")
         var totals: [Double] = []
@@ -133,7 +135,8 @@ enum CLI {
             return 2
         }
         print("arch=\(machineArch()) whisper.cpp=\(found.cli) model=\((found.model as NSString).lastPathComponent)")
-        let hint = Prompts.whisperHint(dictionary: UserDictionary.load())
+        UserDictionary.shared.refresh()
+        let hint = Prompts.whisperHint(dictionary: UserDictionary.shared.entries(for: nil))
         for path in files {
             let url = URL(fileURLWithPath: path)
             guard let samples = try? Audio.load(url) else { continue }
@@ -153,6 +156,27 @@ enum CLI {
             done.wait()
             print(line)
         }
+        return 0
+    }
+
+    /// Two short captures in a row: the second must reuse the open engine (no "mic opened"
+    /// in between). No hotkeys involved.
+    private static func micTest() -> Int32 {
+        let r = Recorder()
+        r.idleCloseSeconds = 2
+        for i in 1...2 {
+            do { try r.start() } catch {
+                print("start failed: \(error.localizedDescription)")
+                return 1
+            }
+            Thread.sleep(forTimeInterval: 1.5)
+            let (samples, peak) = r.stop()
+            print(String(format: "capture %d: %.2fs, peak %.3f, live level %.3f", i,
+                         Double(samples.count) / Recorder.sampleRate, peak, r.currentLevel))
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        Thread.sleep(forTimeInterval: 2.5)   // idle close fires
+        print("done (see ~/Library/Logs/WhisperDictateLite.log for mic opened/closed)")
         return 0
     }
 
@@ -189,10 +213,15 @@ enum CLI {
             check("aac encode", false)
         }
 
-        let dict = UserDictionary.parse("# c\nSalutem\nVeeqo = вику, вико\n\nStill Frozen # brand\n")
-        check("dictionary parse", dict.count == 3 && dict[1].soundsLike == ["вику", "вико"] && dict[2].term == "Still Frozen")
+        let dict = UserDictionary.parse("# c\nSalutem\nвику | вико = Veeqo\n\nстил фрозен = Still Frozen\n= Michael\n")
+        check("dictionary parse (iMac format)", dict.count == 4 && dict[1].variants == ["вику", "вико"]
+              && dict[1].term == "Veeqo" && dict[2].term == "Still Frozen" && dict[3].term == "Michael")
         let sys = Prompts.system(mode: .code, dictionary: dict)
-        check("prompt has dictionary", sys.contains("Veeqo (может звучать как: вику, вико)"))
+        check("prompt has dictionary", sys.contains("Veeqo (может прозвучать как: вику, вико)"))
+        check("dictionary replacements", UserDictionary.apply("Проверь вику и стил   фрозен, но не викунья", entries: dict)
+              == "Проверь Veeqo и Still Frozen, но не викунья")
+        check("legacy Lite format converted", UserDictionary.convertLegacy("# Whisper Dictate Lite\nVeeqo = вику, вико\nSalutem")
+              == "# Whisper Dictate Lite\nвику | вико = Veeqo\nSalutem")
         check("clean quotes", Prompts.clean("«Привет»", mode: .normal) == "Привет")
         check("clean fence", Prompts.clean("```\nhello\n```", mode: .normal) == "hello")
         check("clean silence", Prompts.clean("(тишина)", mode: .normal) == "")

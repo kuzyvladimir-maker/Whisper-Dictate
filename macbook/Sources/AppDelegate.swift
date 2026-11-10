@@ -23,7 +23,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var session = 0
     private var pressedAt = Date()
     private var processingSince = Date()
-    private var dictionary: [DictEntry] = []
+    private let dictionary = UserDictionary.shared
+    private let hearing = HearingAlert()
+    private var context: String?          // bundle id of the app where dictation started
+    private var lastContext: String?
     private var statusItem: NSStatusItem!
     private var tick: Timer?
     private var permissionTimer: Timer?
@@ -71,7 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func reload() {
         gemini.setKeys(Env.loadKeys())
-        dictionary = UserDictionary.load()
+        dictionary.refresh()
+        recorder.idleCloseSeconds = settings.micIdleCloseSeconds
     }
 
     private func ensureHotkey(prompt: Bool) {
@@ -152,6 +156,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state = .holding
         pressedAt = Date()
         flash = nil
+        context = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        if context != nil { lastContext = context }
         if !settings.localOnly && gemini.keyCount > 0 { gemini.warmUp() }
         audioQueue.async {
             var failure: Error?
@@ -163,11 +169,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.session += 1
                         self.state = .idle
                         self.stopTick()
+                        self.hearing.stop()
                     }
                     self.showError("Микрофон: \(failure.localizedDescription)")
                     return
                 }
                 Log.write("recording started")
+                if self.settings.hearingAlert && my == self.session && self.isRecording {
+                    self.hearing.start { [weak self] in
+                        guard let self = self else { return (1, Date()) }
+                        return (self.recorder.currentLevel, self.recorder.lastCallbackAt)
+                    }
+                }
                 // Short delay so Option+key typing (which cancels) does not beep.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
                     if my == self.session && self.isRecording { self.play("start") }
@@ -182,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard isRecording else { return }
         state = .processing
         stopTick()
+        hearing.stop()
         let released = Date()
         play("stop")
         updateIcon()
@@ -202,6 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         session += 1
         state = .idle
         stopTick()
+        hearing.stop()
         audioQueue.async { _ = self.recorder.stop() }
         if !silent {
             play("cancel")
@@ -246,7 +261,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
-        let system = Prompts.system(mode: mode, dictionary: dictionary)
+        dictionary.refresh()
+        let app = context
+        let system = Prompts.system(mode: mode, dictionary: dictionary.entries(for: app))
         let upload = Audio.encodeForUpload(samples, format: settings.audioFormat)
         gemini.transcribe(audio: upload.data, mimeType: upload.mime, audioSeconds: seconds, system: system,
                           user: Prompts.user, models: settings.models(mode: mode, seconds: seconds)) { result in
@@ -273,7 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func runLocal(_ samples: [Int16], released: Date, seconds: Double, token: Int, reason: String?) {
         if let reason = reason { Log.write("local fallback: \(reason)") }
         local.transcribe(samples: samples, language: settings.language,
-                         hint: Prompts.whisperHint(dictionary: dictionary)) { result in
+                         hint: Prompts.whisperHint(dictionary: dictionary.entries(for: context))) { result in
             DispatchQueue.main.async {
                 guard token == self.session, self.state == .processing else { return }
                 switch result {
@@ -299,7 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             updateIcon()
             return
         }
-        var out = text
+        var out = dictionary.apply(text, bundleID: context)
         if settings.appendSpace && mode != .code { out += " " }
         lastText = out
         if settings.paste {
@@ -472,7 +489,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if lastText != nil {
             menu.addItem(item("Скопировать последний текст", #selector(copyLast)))
         }
-        menu.addItem(item("Словарь…", #selector(openDictionary)))
+        menu.addItem(item("Добавить слово из буфера", #selector(addWordFromClipboard)))
+        menu.addItem(item(dictionary.usesICloud ? "Словарь (iCloud, общий)…" : "Словарь…", #selector(openDictionary)))
+        if let app = lastContext, let name = NSRunningApplication.runningApplications(withBundleIdentifier: app).first?.localizedName {
+            menu.addItem(item("Словарь для «\(name)»…", #selector(openAppDictionary)))
+        }
         menu.addItem(item("Папка настроек…", #selector(openConfigDir)))
         menu.addItem(item("Перечитать ключи и словарь", #selector(reloadAll)))
         menu.addItem(item("Журнал…", #selector(openLog)))
@@ -542,10 +563,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openDictionary() {
-        let url = Paths.dictionaryFile
+        let url = dictionary.usesICloud ? UserDictionary.master : UserDictionary.cache
         if !FileManager.default.fileExists(atPath: url.path) {
-            try? FileManager.default.createDirectory(at: Paths.configDir, withIntermediateDirectories: true)
-            var template = "# Свой словарь: одно слово или имя в строке.\n# Можно подсказать звучание: Veeqo = вику\n"
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            var template = UserDictionary.header
             if let bundled = Bundle.main.url(forResource: "dictionary.example", withExtension: "txt"),
                let text = try? String(contentsOf: bundled, encoding: .utf8) {
                 template = text
@@ -553,6 +574,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? template.write(to: url, atomically: true, encoding: .utf8)
         }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openAppDictionary() {
+        guard let key = UserDictionary.appKey(lastContext) else { return }
+        let dir = dictionary.usesICloud ? UserDictionary.masterAppsDir : UserDictionary.cacheAppsDir
+        let url = dir.appendingPathComponent(key + ".txt")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let text = "# Словарь для приложения: \(lastContext ?? key)\n# Формат: что_услышал | вариант = Как писать\n"
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+        }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func addWordFromClipboard() {
+        let clip = NSPasteboard.general.string(forType: .string) ?? ""
+        do {
+            let line = try dictionary.add(clip)
+            note("В словарь добавлено: \(line)")
+            Log.write("dictionary: word added (\(line.count) chars)")
+        } catch {
+            showError(error.localizedDescription)
+        }
     }
 
     @objc private func openConfigDir() {
@@ -585,7 +629,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func quit() {
+        recorder.shutdown()
+        NSApp.terminate(nil)
+    }
 
     private func alert(_ title: String, _ text: String) {
         NSApp.activate(ignoringOtherApps: true)

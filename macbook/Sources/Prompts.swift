@@ -52,8 +52,8 @@ enum Prompts {
         }
         if !dictionary.isEmpty {
             let items = dictionary.map { e -> String in
-                e.soundsLike.isEmpty ? e.term
-                    : "\(e.term) (может звучать как: \(e.soundsLike.joined(separator: ", ")))"
+                e.variants.isEmpty ? e.term
+                    : "\(e.term) (может прозвучать как: \(e.variants.joined(separator: ", ")))"
             }
             parts.append("Словарь. Если в речи звучит одно из этих слов или имён, пиши его именно так: "
                          + items.joined(separator: "; ") + ".")

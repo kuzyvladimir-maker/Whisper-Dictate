@@ -20,16 +20,70 @@ final class Recorder {
     static let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sampleRate,
                                             channels: 1, interleaved: true)!
 
+    // One engine stays running between dictations and is closed only after a pause
+    // (lesson from the iMac version: opening/closing CoreAudio on every dictation is where
+    // hangs and crashes happen; Lite once crashed inside AudioUnitInitialize on a restart).
+    // Frames are kept only while capturing; the level meter runs whenever the mic is open.
     private var engine: AVAudioEngine?
     private var converter: AVAudioConverter?
     private var samples: [Int16] = []
     private var peak: Int16 = 0
+    private var capturing = false
+    private var idleClose: DispatchWorkItem?
+    private var configObserver: NSObjectProtocol?
     private let lock = NSLock()
+    private let queue = DispatchQueue(label: "recorder-engine")
 
-    /// A fresh engine per recording picks up whatever input device is current
-    /// (AirPods connected, display mic unplugged, ...).
+    /// Seconds the mic stays open after a dictation (0 = close right away).
+    var idleCloseSeconds = 30.0
+    /// Smoothed live peak (0...1) and the time of the last audio callback, for the
+    /// "тебя не слышно" warning.
+    private var level: Float = 0
+    private var callbackAt = Date()
+    var currentLevel: Float { lock.lock(); defer { lock.unlock() }; return level }
+    var lastCallbackAt: Date { lock.lock(); defer { lock.unlock() }; return callbackAt }
+
     func start() throws {
-        _ = stop()
+        try queue.sync {
+            idleClose?.cancel()
+            idleClose = nil
+            lock.lock()
+            samples = []
+            samples.reserveCapacity(Int(Recorder.sampleRate) * 30)
+            peak = 0
+            lock.unlock()
+            if engine == nil || engine?.isRunning == false {
+                try openEngine()
+            }
+            lock.lock()
+            capturing = true
+            callbackAt = Date()
+            lock.unlock()
+        }
+    }
+
+    /// Returns the captured samples and the peak level (0...1). Safe to call when idle.
+    func stop() -> (samples: [Int16], peak: Float) {
+        return queue.sync {
+            lock.lock()
+            capturing = false
+            let out = samples
+            let p = Float(peak) / Float(Int16.max)
+            samples = []
+            peak = 0
+            lock.unlock()
+            scheduleIdleClose()
+            return (out, p)
+        }
+    }
+
+    /// Close the mic now (app quit, settings change).
+    func shutdown() {
+        queue.sync { closeEngine() }
+    }
+
+    private func openEngine() throws {
+        closeEngine()
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let inFormat = input.outputFormat(forBus: 0)
@@ -39,9 +93,6 @@ final class Recorder {
         }
         conv.downmix = true
         lock.lock()
-        samples = []
-        samples.reserveCapacity(Int(Recorder.sampleRate) * 30)
-        peak = 0
         converter = conv
         lock.unlock()
         input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
@@ -55,36 +106,67 @@ final class Recorder {
             throw error
         }
         self.engine = engine
+        // Input device changed (AirPods, display mic): rebuild with the new format.
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.queue.async {
+                Log.write("audio device changed, reopening mic")
+                let wasCapturing: Bool = { self.lock.lock(); defer { self.lock.unlock() }; return self.capturing }()
+                if wasCapturing {
+                    try? self.openEngine()
+                } else {
+                    self.closeEngine()
+                }
+            }
+        }
+        Log.write("mic opened: \(Int(inFormat.sampleRate)) Hz, \(inFormat.channelCount) ch")
     }
 
-    /// Returns the captured samples and the peak level (0...1). Safe to call when idle.
-    func stop() -> (samples: [Int16], peak: Float) {
-        if let engine = engine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+    private func closeEngine() {
+        if let obs = configObserver {
+            NotificationCenter.default.removeObserver(obs)
+            configObserver = nil
         }
-        engine = nil
+        guard let engine = engine else { return }
+        self.engine = nil
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
         lock.lock()
-        let out = samples
-        let p = Float(peak) / Float(Int16.max)
-        samples = []
-        peak = 0
         converter = nil
+        level = 0
         lock.unlock()
-        return (out, p)
+        Log.write("mic closed")
+    }
+
+    private func scheduleIdleClose() {
+        idleClose?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            let busy: Bool = { self.lock.lock(); defer { self.lock.unlock() }; return self.capturing }()
+            if !busy { self.closeEngine() }
+        }
+        idleClose = work
+        queue.asyncAfter(deadline: .now() + max(0, idleCloseSeconds), execute: work)
     }
 
     private func append(_ buffer: AVAudioPCMBuffer) {
         lock.lock()
         defer { lock.unlock() }
+        callbackAt = Date()
         guard let conv = converter, let converted = Audio.convert(buffer, with: conv, endOfStream: false) else {
             return
         }
-        samples.append(contentsOf: converted)
+        var bufPeak: Int16 = 0
         for s in converted {
             let a = s == Int16.min ? Int16.max : abs(s)
-            if a > peak { peak = a }
+            if a > bufPeak { bufPeak = a }
         }
+        level = max(Float(bufPeak) / Float(Int16.max), level * 0.9)
+        guard capturing else { return }
+        samples.append(contentsOf: converted)
+        if bufPeak > peak { peak = bufPeak }
     }
 }
 

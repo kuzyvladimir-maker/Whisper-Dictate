@@ -64,6 +64,8 @@ final class Settings {
     var sounds = true
     var appendSpace = true
     var paste = true          // false: only copy to the clipboard
+    var micIdleCloseSeconds = 30.0
+    var hearingAlert = true
     var restoreClipboard = true
     var restoreDelay = 0.8
     var holdThreshold = 0.35
@@ -113,6 +115,8 @@ final class Settings {
         if let v = obj["sounds"] as? Bool { sounds = v }
         if let v = obj["append_space"] as? Bool { appendSpace = v }
         if let v = obj["paste"] as? Bool { paste = v }
+        if let v = obj["mic_idle_close_seconds"] as? Double { micIdleCloseSeconds = v }
+        if let v = obj["hearing_alert"] as? Bool { hearingAlert = v }
         if let v = obj["restore_clipboard"] as? Bool { restoreClipboard = v }
         if let v = obj["restore_delay_seconds"] as? Double { restoreDelay = v }
         if let v = obj["hold_threshold_seconds"] as? Double { holdThreshold = v }
@@ -136,6 +140,8 @@ final class Settings {
             "sounds": sounds,
             "append_space": appendSpace,
             "paste": paste,
+            "mic_idle_close_seconds": micIdleCloseSeconds,
+            "hearing_alert": hearingAlert,
             "restore_clipboard": restoreClipboard,
             "restore_delay_seconds": restoreDelay,
             "hold_threshold_seconds": holdThreshold,
@@ -194,36 +200,199 @@ enum Env {
 }
 
 struct DictEntry {
-    let term: String
-    let soundsLike: [String]
+    let term: String          // how it must be written
+    let variants: [String]    // how Whisper / Gemini may mis-hear it
 }
 
-enum UserDictionary {
-    /// Lines: `Term` or `Term = how it may sound, another variant`. `#` starts a comment.
-    static func load() -> [DictEntry] {
-        guard let text = try? String(contentsOf: Paths.dictionaryFile, encoding: .utf8) else { return [] }
-        return parse(text)
+/// Shared dictionary, same file and format as the iMac version:
+///   `услышал | ещё вариант = Как писать`   replacement + spelling hint
+///   `Как писать`                           spelling hint only
+/// Master copy lives in iCloud Drive (synced between Macs, private); a local cache
+/// covers an evicted or not-yet-downloaded file. Per-app dictionaries sit next to it
+/// in `dictionaries/<bundle id>.txt`.
+final class UserDictionary {
+    static let shared = UserDictionary()
+
+    static let iCloudDir = Paths.home.appendingPathComponent(
+        "Library/Mobile Documents/com~apple~CloudDocs/WhisperDictate", isDirectory: true)
+    static let master = iCloudDir.appendingPathComponent("dictionary.txt")
+    static let masterAppsDir = iCloudDir.appendingPathComponent("dictionaries", isDirectory: true)
+    static let cache = Paths.configDir.appendingPathComponent("dictionary.cache.txt")
+    static let cacheAppsDir = Paths.configDir.appendingPathComponent("dictionaries.cache", isDirectory: true)
+    static let legacy = Paths.dictionaryFile   // old Lite-only file (`Term = sounds, like`)
+
+    private var global: [DictEntry] = []
+    private var globalStamp = ""
+    private var perApp: [String: (stamp: String, entries: [DictEntry])] = [:]
+    private let lock = NSLock()
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return global.count }
+    var usesICloud: Bool { FileManager.default.fileExists(atPath: UserDictionary.iCloudDir.path) }
+
+    /// Cheap: re-parses only when the master file changed.
+    func refresh() {
+        let (text, stamp) = UserDictionary.read(master: UserDictionary.master, cache: UserDictionary.cache,
+                                                legacy: UserDictionary.legacy)
+        lock.lock()
+        defer { lock.unlock() }
+        if stamp != globalStamp {
+            global = text.map(UserDictionary.parse) ?? []
+            globalStamp = stamp
+        }
+    }
+
+    func entries(for bundleID: String?) -> [DictEntry] {
+        lock.lock()
+        var out = global
+        lock.unlock()
+        if let key = UserDictionary.appKey(bundleID) {
+            let (text, stamp) = UserDictionary.read(
+                master: UserDictionary.masterAppsDir.appendingPathComponent(key + ".txt"),
+                cache: UserDictionary.cacheAppsDir.appendingPathComponent(key + ".txt"), legacy: nil)
+            lock.lock()
+            if perApp[key]?.stamp != stamp { perApp[key] = (stamp, text.map(UserDictionary.parse) ?? []) }
+            out += perApp[key]?.entries ?? []
+            lock.unlock()
+        }
+        return out
+    }
+
+    /// Post-processing replacements (longer variants first), like the iMac Vocabulary.apply.
+    func apply(_ text: String, bundleID: String?) -> String {
+        return UserDictionary.apply(text, entries: entries(for: bundleID))
+    }
+
+    static func apply(_ text: String, entries: [DictEntry]) -> String {
+        var pairs: [(String, String)] = []
+        for e in entries { for v in e.variants { pairs.append((v, e.term)) } }
+        pairs.sort { $0.0.count > $1.0.count }
+        var out = text
+        for (variant, term) in pairs {
+            let words = variant.split(whereSeparator: { $0.isWhitespace }).map {
+                NSRegularExpression.escapedPattern(for: String($0))
+            }
+            guard !words.isEmpty else { continue }
+            let pattern = "(?<![\\p{L}\\p{N}_])" + words.joined(separator: "\\s+") + "(?![\\p{L}\\p{N}_])"
+            guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            out = re.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out),
+                                              withTemplate: NSRegularExpression.escapedTemplate(for: term))
+        }
+        return out
+    }
+
+    /// "Добавить слово из буфера": `Term` or a full `услышал = Как писать` line.
+    func add(_ raw: String) throws -> String {
+        let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .newlines).first?.trimmingCharacters(in: .whitespaces) ?? ""
+        guard !line.isEmpty, line.count <= 120, !line.hasPrefix("#") else {
+            throw NSError(domain: "dictionary", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "В буфере нет подходящего слова (одна строка, до 120 символов)"])
+        }
+        let target = usesICloud ? UserDictionary.master : UserDictionary.cache
+        let fm = FileManager.default
+        try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var text = (try? String(contentsOf: target, encoding: .utf8)) ?? UserDictionary.header
+        if text.components(separatedBy: .newlines).contains(where: { $0.trimmingCharacters(in: .whitespaces) == line }) {
+            return line
+        }
+        if !text.hasSuffix("\n") { text += "\n" }
+        text += line + "\n"
+        try text.write(to: target, atomically: true, encoding: .utf8)
+        refresh()
+        return line
+    }
+
+    static let header = """
+    # Словарь Whisper Dictate — общий для iMac и MacBook (iCloud Drive).
+    # Формат:  что_услышал | ещё_вариант = Как писать
+    #          Как писать            (только подсказка написания, без замены)
+    # Строки с # и пустые игнорируются.
+
+    """
+
+    static func appKey(_ bundleID: String?) -> String? {
+        guard let id = bundleID, !id.isEmpty else { return nil }
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
+        var key = String(id.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
+        key = key.trimmingCharacters(in: CharacterSet(charactersIn: "._"))
+        return key.isEmpty ? nil : String(key.prefix(120))
+    }
+
+    /// Reads the master; refreshes the cache from it; falls back to the cache when the
+    /// iCloud file is evicted / missing (and asks iCloud to download it).
+    static func read(master: URL, cache: URL, legacy: URL?) -> (String?, String) {
+        let fm = FileManager.default
+        if let text = try? String(contentsOf: master, encoding: .utf8) {
+            if (try? String(contentsOf: cache, encoding: .utf8)) != text {
+                try? fm.createDirectory(at: cache.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? text.write(to: cache, atomically: true, encoding: .utf8)
+            }
+            return (text, "m:" + stamp(master))
+        }
+        let placeholder = master.deletingLastPathComponent()
+            .appendingPathComponent("." + master.lastPathComponent + ".icloud")
+        if fm.fileExists(atPath: placeholder.path) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/brctl")
+            p.arguments = ["download", master.path]
+            try? p.run()
+        }
+        if let text = try? String(contentsOf: cache, encoding: .utf8) {
+            return (text, "c:" + stamp(cache))
+        }
+        if let legacy = legacy, let text = try? String(contentsOf: legacy, encoding: .utf8) {
+            return (convertLegacy(text), "l:" + stamp(legacy))
+        }
+        return (nil, "none")
+    }
+
+    private static func stamp(_ url: URL) -> String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let date = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        return "\(date)-\(size)"
+    }
+
+    /// Old Lite file wrote `Term = sounds, like`; the shared format is `sounds | like = Term`.
+    static func convertLegacy(_ text: String) -> String {
+        guard text.contains("Whisper Dictate Lite") else { return text }
+        return text.components(separatedBy: .newlines).map { line -> String in
+            let s = line.trimmingCharacters(in: .whitespaces)
+            guard !s.hasPrefix("#"), let eq = s.firstIndex(of: "=") else { return line }
+            let term = s[..<eq].trimmingCharacters(in: .whitespaces)
+            let variants = s[s.index(after: eq)...].components(separatedBy: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            return variants.isEmpty ? term : variants.joined(separator: " | ") + " = " + term
+        }.joined(separator: "\n")
     }
 
     static func parse(_ text: String) -> [DictEntry] {
         var out: [DictEntry] = []
         for line in text.components(separatedBy: .newlines) {
-            var s = line
-            if let hash = s.firstIndex(of: "#") { s = String(s[..<hash]) }
-            s = s.trimmingCharacters(in: .whitespaces)
-            if s.isEmpty { continue }
-            if let eq = s.firstIndex(of: "=") {
-                let term = s[..<eq].trimmingCharacters(in: .whitespaces)
-                let variants = s[s.index(after: eq)...]
-                    .components(separatedBy: ",")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
-                if !term.isEmpty { out.append(DictEntry(term: term, soundsLike: variants)) }
+            let s = line.trimmingCharacters(in: .whitespaces)
+            if s.isEmpty || s.hasPrefix("#") { continue }
+            if let eq = s.lastIndex(of: "=") {
+                let term = s[s.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                let variants = s[..<eq].components(separatedBy: "|")
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                if !term.isEmpty { out.append(DictEntry(term: term, variants: variants)) }
             } else {
-                out.append(DictEntry(term: s, soundsLike: []))
+                out.append(DictEntry(term: s, variants: []))
             }
         }
-        return out
+        // One entry per term: merge variants of duplicates.
+        var merged: [String: Int] = [:]
+        var result: [DictEntry] = []
+        for e in out {
+            if let i = merged[e.term.lowercased()] {
+                let vs = result[i].variants + e.variants.filter { v in !result[i].variants.contains(v) }
+                result[i] = DictEntry(term: result[i].term, variants: vs)
+            } else {
+                merged[e.term.lowercased()] = result.count
+                result.append(e)
+            }
+        }
+        return result
     }
 }
 
