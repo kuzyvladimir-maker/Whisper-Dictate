@@ -45,3 +45,8 @@ transcripts*
 # Tool caches
 .ruff_cache/
 .pytest_cache/
+
+# Shared dictionary caches (personal: names, partners) — never commit
+dictionary.cache.txt
+*.cache.txt
+dictionaries.cache/

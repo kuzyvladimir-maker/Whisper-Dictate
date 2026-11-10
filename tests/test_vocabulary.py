@@ -12,9 +12,9 @@ class VocabularyTests(unittest.TestCase):
     def test_bare_line_is_a_term_without_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "dictionary.txt"
-            path.write_text("вику | вико = Veeqo\nМихаил Мовсясян\n", encoding="utf-8")
+            path.write_text("вику | вико = Veeqo\nИван Петров\n", encoding="utf-8")
             v = Vocabulary(path)
-            self.assertEqual(v.terms, ["Veeqo", "Михаил Мовсясян"])
+            self.assertEqual(v.terms, ["Veeqo", "Иван Петров"])
             self.assertEqual(v.apply("проверь вику"), "проверь Veeqo")
 
     def test_evicted_master_uses_cache_and_is_not_recreated(self) -> None:
