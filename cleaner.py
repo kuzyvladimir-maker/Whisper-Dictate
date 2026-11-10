@@ -127,7 +127,7 @@ class TextCleaner:
         return configured or shutil.which("claude")
 
     # --- публичное API ---------------------------------------------------------
-    def clean(self, text: str, backend: str | None = None) -> tuple[str, str | None]:
+    def clean(self, text: str, backend: str | None = None, context: str | None = None) -> tuple[str, str | None]:
         """Возвращает (текст, использованный_бэкенд|None). Никогда не бросает."""
         use = backend or self.backend
         if use not in ("local", "claude", "gemini"):
@@ -144,7 +144,7 @@ class TextCleaner:
             if use == "local":
                 cleaned = self._clean_local(text)
             elif use == "gemini":
-                cleaned = self._clean_gemini(text)
+                cleaned = self._clean_gemini(text, context=context)
             else:
                 cleaned = self._clean_claude(text)
         except Exception as exc:
@@ -211,7 +211,7 @@ class TextCleaner:
             payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         return str((payload.get("message") or {}).get("content") or "")
 
-    def _clean_gemini(self, text: str) -> str:
+    def _clean_gemini(self, text: str, context: str | None = None) -> str:
         """Only the finished transcript goes to Google; audio stays on the Mac.
         Hard deadline (default 4 s, a little more for long texts): past it the caller
         keeps the raw text, so a dictation never hangs on the network."""
@@ -219,6 +219,15 @@ class TextCleaner:
         extra = _MODE_PROMPTS.get(self.mode, "")
         if extra:
             system = system + "\n\n" + extra
+        # The shared dictionary is the spelling authority. Unlike the small local model,
+        # Gemini does not drift toward list words, so it gets the terms (as Lite does).
+        terms = self.vocabulary.all_terms(context) if self.vocabulary is not None else []
+        if terms:
+            system += (
+                "\n\nСловарь правильных написаний (бренды, имена, термины): " + ", ".join(terms[:300])
+                + ". Если слово из словаря записано искажённо (например, кириллицей по звучанию), "
+                "напиши его как в словаре. Остальные незнакомые слова не трогай."
+            )
         base = float(self.config.get("cleanup_gemini_timeout", 4.0))
         deadline = min(10.0, base + len(text.split()) / 150.0)
         t0 = time.monotonic()

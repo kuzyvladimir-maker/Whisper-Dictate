@@ -24,7 +24,7 @@ from live_chunker import LiveChunker
 from paste import ClipboardPaste, notify, play_sound
 from recorder import AudioRecorder
 from transcriber import Transcriber, TranscriptionResult
-from vocabulary import Vocabulary
+from vocabulary import ICLOUD_DIR, Vocabulary
 from whisper_server import (
     WhisperCli,
     WhisperEngine,
@@ -265,9 +265,20 @@ class WhisperDictateApp(rumps.App):
         self._secure_data_paths()
         self._prune_transcript_logs()
 
+        # Shared dictionary (same file as macbook/ Lite): master in iCloud Drive when
+        # available, with a local cache for an evicted or not-yet-synced file.
+        dict_dir = Path(str(self.config.get("dictionary_dir", "") or "")).expanduser()
+        if not str(self.config.get("dictionary_dir", "") or ""):
+            dict_dir = ICLOUD_DIR if ICLOUD_DIR.parent.exists() else PATHS["data_dir"]
         self.vocabulary = Vocabulary(
-            PATHS["data_dir"] / "dictionary.txt",
-            context_dir=PATHS["data_dir"] / "dictionaries",
+            dict_dir / "dictionary.txt",
+            context_dir=dict_dir / "dictionaries",
+            cache_path=PATHS["data_dir"] / "dictionary.cache.txt",
+            context_cache_dir=PATHS["data_dir"] / "dictionaries.cache",
+        )
+        log(
+            f"dictionary: {len(self.vocabulary.rules)} rules, {len(self.vocabulary.terms)} terms "
+            f"from {self.vocabulary._source}"
         )
 
         model_path = PATHS["models_dir"] / self.config["model_filename"]
@@ -408,6 +419,7 @@ class WhisperDictateApp(rumps.App):
                 "Открыть словарь для активного приложения",
                 callback=self.open_context_dictionary,
             ),
+            rumps.MenuItem("➕ Добавить слово из буфера", callback=self.add_word_from_clipboard),
             rumps.MenuItem("Открыть лог расшифровок", callback=self.open_transcripts),
             rumps.MenuItem("Открыть папку записей", callback=self.open_recordings),
             rumps.MenuItem("Quit", callback=self.quit_app),
@@ -649,6 +661,16 @@ class WhisperDictateApp(rumps.App):
             subprocess.run(["open", str(self.vocabulary.path)], check=False)
         except OSError as exc:
             log(f"could not open dictionary: {exc}")
+
+    def add_word_from_clipboard(self, _sender) -> None:
+        try:
+            import pyperclip
+
+            line = self.vocabulary.add_line(pyperclip.paste())
+            log(f"dictionary: word added ({len(line)} chars)")
+            notify("Whisper Dictate", f"В словарь добавлено: {line}")
+        except Exception as exc:
+            notify("Whisper Dictate", f"Не добавил: {exc}")
 
     def open_context_dictionary(self, _sender) -> None:
         context = self.last_active_context or self._frontmost_app_context()
@@ -1223,7 +1245,7 @@ class WhisperDictateApp(rumps.App):
                     # чистка может только улучшить то, что уходит в буфер.
                     self._set_status("processing", "✨", "Полирую текст...")
                     t_clean = time.monotonic()
-                    cleaned, used = self.cleaner.clean(text)
+                    cleaned, used = self.cleaner.clean(text, context=context)
                     if used is not None:
                         text = cleaned
                         model = f" {self.cleaner.last_model}" if used == "gemini" else ""
