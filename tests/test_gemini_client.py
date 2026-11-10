@@ -21,7 +21,10 @@ class ScriptedClient(GeminiTextClient):
     def _post(self, model, key, body, timeout):
         self.calls.append((model, key))
         delay, status, payload = self.script[key](model) if callable(self.script[key]) else self.script[key]
-        time.sleep(min(delay, timeout))
+        if delay > timeout:  # like a real socket: the read times out at the deadline
+            time.sleep(timeout)
+            raise TimeoutError("timed out")
+        time.sleep(delay)
         return status, payload
 
 
