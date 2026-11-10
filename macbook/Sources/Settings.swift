@@ -58,17 +58,25 @@ final class Settings {
     static let shared = Settings()
 
     var mode: DictationMode = .normal
-    var hotkey: HotkeyChoice = .rightOption
+    var hotkey: HotkeyChoice = .fn
     var localOnly = false
     var localFallback = true
     var sounds = true
     var appendSpace = true
+    var paste = true          // false: only copy to the clipboard
     var restoreClipboard = true
     var restoreDelay = 0.8
     var holdThreshold = 0.35
     var maxRecordingSeconds = 600.0
-    var model = "gemini-2.5-flash"
-    var fallbackModels = ["gemini-2.5-flash-lite"]
+    // Free tier (Nov 2026): 3.6-flash 5/min, 20/day per project; 3.5-flash-lite 15/min, 500/day.
+    // So flash-lite carries everyday short phrases; flash is spent on long dictations and on the
+    // "письмо" / "код" modes where the extra quality matters.
+    static let defaultModel = "gemini-3.6-flash"
+    static let defaultFastModel = "gemini-3.5-flash-lite"
+    var model = Settings.defaultModel           // long audio, email and code modes
+    var fastModel = Settings.defaultFastModel   // short phrases in normal mode
+    var longAudioSeconds = 30.0
+    var fallbackModels: [String] = []
     var language = "ru"
     var audioFormat = "aac"   // "aac" (smaller upload) or "wav"
     var whisperCli = ""
@@ -76,10 +84,23 @@ final class Settings {
 
     private init() { load() }
 
-    var models: [String] {
-        var out = [model]
-        for m in fallbackModels where !m.isEmpty && !out.contains(m) { out.append(m) }
+    /// Request order for one dictation. A 429 moves to the next key, then down this list;
+    /// a 404 ("no longer available") skips the model. Defaults go last so a stale config
+    /// still ends up on a working model.
+    func models(mode: DictationMode, seconds: Double) -> [String] {
+        let wantsQuality = mode != .normal || seconds >= longAudioSeconds
+        var chain = wantsQuality ? [model, fastModel] : [fastModel, model]
+        chain += fallbackModels
+        chain += wantsQuality ? [Settings.defaultModel, Settings.defaultFastModel]
+                              : [Settings.defaultFastModel, Settings.defaultModel]
+        var out: [String] = []
+        for m in chain where !m.isEmpty && !Settings.isRetired(m) && !out.contains(m) { out.append(m) }
         return out
+    }
+
+    /// Gemini 2.x answers 404 "no longer available to new users" on new keys.
+    static func isRetired(_ model: String) -> Bool {
+        model.hasPrefix("gemini-2.") || model.hasPrefix("gemini-1.")
     }
 
     func load() {
@@ -91,12 +112,15 @@ final class Settings {
         if let v = obj["local_fallback"] as? Bool { localFallback = v }
         if let v = obj["sounds"] as? Bool { sounds = v }
         if let v = obj["append_space"] as? Bool { appendSpace = v }
+        if let v = obj["paste"] as? Bool { paste = v }
         if let v = obj["restore_clipboard"] as? Bool { restoreClipboard = v }
         if let v = obj["restore_delay_seconds"] as? Double { restoreDelay = v }
         if let v = obj["hold_threshold_seconds"] as? Double { holdThreshold = v }
         if let v = obj["max_recording_seconds"] as? Double { maxRecordingSeconds = v }
-        if let v = obj["model"] as? String, !v.isEmpty { model = v }
-        if let v = obj["fallback_models"] as? [String] { fallbackModels = v }
+        if let v = obj["model"] as? String, !v.isEmpty, !Settings.isRetired(v) { model = v }
+        if let v = obj["fast_model"] as? String, !v.isEmpty, !Settings.isRetired(v) { fastModel = v }
+        if let v = obj["long_audio_seconds"] as? Double { longAudioSeconds = v }
+        if let v = obj["fallback_models"] as? [String] { fallbackModels = v.filter { !Settings.isRetired($0) } }
         if let v = obj["language"] as? String, !v.isEmpty { language = v }
         if let v = obj["audio_format"] as? String, v == "aac" || v == "wav" { audioFormat = v }
         if let v = obj["whisper_cli"] as? String { whisperCli = v }
@@ -111,11 +135,14 @@ final class Settings {
             "local_fallback": localFallback,
             "sounds": sounds,
             "append_space": appendSpace,
+            "paste": paste,
             "restore_clipboard": restoreClipboard,
             "restore_delay_seconds": restoreDelay,
             "hold_threshold_seconds": holdThreshold,
             "max_recording_seconds": maxRecordingSeconds,
             "model": model,
+            "fast_model": fastModel,
+            "long_audio_seconds": longAudioSeconds,
             "fallback_models": fallbackModels,
             "language": language,
             "audio_format": audioFormat,

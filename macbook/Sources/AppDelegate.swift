@@ -55,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hotkey.choice = settings.hotkey
         hotkey.onDown = { [weak self] in self?.hotkeyDown() }
         hotkey.onUp = { [weak self] in self?.hotkeyUp() }
-        hotkey.onCombo = { [weak self] in self?.combo() }
+        hotkey.onCombo = { [weak self] what in self?.combo(what) }
         hotkey.onKey = { [weak self] code in self?.keyPressed(code) ?? false }
 
         if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
@@ -65,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         ensureHotkey(prompt: true)
         updateIcon()
-        Log.write("started: keys=\(gemini.keyCount) model=\(settings.model) local=\(local.isAvailable) "
+        Log.write("started: keys=\(gemini.keyCount) models=\(settings.fastModel)/\(settings.model) local=\(local.isAvailable) "
                   + "hotkey=\(settings.hotkey.rawValue) arch=\(machineArch())")
     }
 
@@ -96,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isRecording: Bool { state == .holding || state == .toggled }
 
     private func hotkeyDown() {
+        Log.write("hotkey down (state=\(state))")
         switch state {
         case .idle: startRecording()
         case .toggled: finishRecording()
@@ -104,6 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func hotkeyUp() {
+        Log.write("hotkey up (state=\(state), held \(fmt(Date().timeIntervalSince(pressedAt)))s)")
         guard state == .holding else { return }
         if Date().timeIntervalSince(pressedAt) >= settings.holdThreshold {
             finishRecording()
@@ -113,8 +115,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func combo() {
-        if state == .holding { cancelRecording(silent: true) }
+    private func combo(_ what: String) {
+        if state == .holding {
+            Log.write("combo with hotkey (\(what)): recording cancelled")
+            cancelRecording(silent: true)
+        }
     }
 
     private func keyPressed(_ code: Int64) -> Bool {
@@ -162,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.showError("Микрофон: \(failure.localizedDescription)")
                     return
                 }
+                Log.write("recording started")
                 // Short delay so Option+key typing (which cancels) does not beep.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
                     if my == self.session && self.isRecording { self.play("start") }
@@ -182,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let my = session
         audioQueue.async {
             let (samples, peak) = self.recorder.stop()
+            Log.write("recording stopped: \(fmt(Double(samples.count) / Recorder.sampleRate))s, peak \(fmt(Double(peak)))")
             DispatchQueue.main.async {
                 guard my == self.session else { return }
                 self.process(samples: samples, peak: peak, released: released)
@@ -191,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func cancelRecording(silent: Bool) {
         guard isRecording else { return }
+        Log.write("recording cancelled\(silent ? " (combo)" : " (Esc)")")
         session += 1
         state = .idle
         stopTick()
@@ -241,7 +249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let system = Prompts.system(mode: mode, dictionary: dictionary)
         let upload = Audio.encodeForUpload(samples, format: settings.audioFormat)
         gemini.transcribe(audio: upload.data, mimeType: upload.mime, audioSeconds: seconds, system: system,
-                          user: Prompts.user, models: settings.models) { result in
+                          user: Prompts.user, models: settings.models(mode: mode, seconds: seconds)) { result in
             DispatchQueue.main.async {
                 guard token == self.session, self.state == .processing else { return }
                 switch result {
@@ -294,7 +302,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var out = text
         if settings.appendSpace && mode != .code { out += " " }
         lastText = out
-        paster.paste(out, restore: settings.restoreClipboard, restoreDelay: settings.restoreDelay)
+        if settings.paste {
+            paster.paste(out, restore: settings.restoreClipboard, restoreDelay: settings.restoreDelay)
+        } else {
+            paster.copy(out)
+        }
         let latency = Date().timeIntervalSince(released)
         lastInfo = String(format: "%.1f с после отпускания · %@ · запись %.0f с", latency, engine, seconds)
         Log.write("done: audio=\(fmt(seconds))s release->paste=\(fmt(latency))s engine=\(engine) chars=\(out.count)")
@@ -415,7 +427,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else if gemini.keyCount == 0 {
             menu.addItem(info("⚠️ Нет ключа Gemini (~/.config/whisper-dictate/env)"))
         } else {
-            menu.addItem(info("Gemini · \(settings.model) · ключей: \(gemini.keyCount)"))
+            menu.addItem(info("Gemini · \(settings.fastModel) / \(settings.model) · ключей: \(gemini.keyCount)"))
         }
         if !lastInfo.isEmpty { menu.addItem(info("Последняя: \(lastInfo)")) }
         if let f = flash { menu.addItem(info("⚠️ \(f)")) }

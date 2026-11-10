@@ -272,16 +272,16 @@ final class GeminiClient {
             job.tried.remove("\(model)#\(keyIndex)")
             Log.write("gemini \(tag): thinking config rejected, retrying without it")
             job.next()
+        case let code where code == 404 || ((code == 400 || code == 403) && GeminiClient.modelUnavailable(message)):
+            missingModels.insert(model)
+            Log.write("gemini \(model): unavailable (\(status) \(message.prefix(100))), next model")
+            job.lastError = .http(status, message)
+            job.next()
         case 400 where message.contains("API key") || message.contains("API_KEY"),
              401, 403:
             keyBanned[keyIndex] = Date().addingTimeInterval(6 * 3600)
             Log.write("gemini key#\(keyIndex + 1): rejected (\(status)), disabled for 6h")
             job.lastError = .badKeys
-            job.next()
-        case 404:
-            missingModels.insert(model)
-            Log.write("gemini \(model): not found, skipping model")
-            job.lastError = .http(404, message)
             job.next()
         case 500...599:
             Log.write("gemini \(tag): \(status) \(message.prefix(120))")
@@ -291,6 +291,12 @@ final class GeminiClient {
             Log.write("gemini \(tag): \(status) \(message.prefix(200))")
             job.completion(.failure(.http(status, message)))
         }
+    }
+
+    static func modelUnavailable(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return m.contains("no longer available") || m.contains("is not found") || m.contains("not found for api")
+            || m.contains("is not supported for generatecontent") || m.contains("model not found")
     }
 
     private func parse(_ json: [String: Any]) -> (String, String?, String?) {

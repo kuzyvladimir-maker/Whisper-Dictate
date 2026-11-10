@@ -1,17 +1,17 @@
 import Cocoa
 
-// Global hotkey through a CGEvent tap. A single modifier key (right Option by default)
+// Global hotkey through a CGEvent tap. A single modifier key (Fn by default)
 // works as the trigger: macOS has no "modifier alone" hotkey API, but flagsChanged events
 // carry the device-specific left/right bits. An active (not listen-only) tap needs only
 // the Accessibility permission, which pasting needs anyway, and lets us swallow Esc
 // while recording.
 
 final class HotkeyMonitor {
-    var choice: HotkeyChoice = .rightOption
+    var choice: HotkeyChoice = .fn
     var onDown: (() -> Void)?
     var onUp: (() -> Void)?
     /// Any other key or modifier while the hotkey is held (Option+key typing, Fn+F1, ...).
-    var onCombo: (() -> Void)?
+    var onCombo: ((String) -> Void)?
     /// Key down while not holding the hotkey. Return true to swallow the event.
     var onKey: ((Int64) -> Bool)?
 
@@ -45,6 +45,7 @@ final class HotkeyMonitor {
             return Unmanaged.passUnretained(event)
         case .flagsChanged:
             let code = event.getIntegerValueField(.keyboardEventKeycode)
+            let foreign = isForeign(event)
             if code == choice.keyCode {
                 let down = pressed(event.flags)
                 if down && !isHeld {
@@ -54,14 +55,14 @@ final class HotkeyMonitor {
                     isHeld = false
                     onUp?()
                 }
-            } else if isHeld {
-                onCombo?()
+            } else if isHeld && !foreign {
+                onCombo?("modifier \(code) flags 0x\(String(event.flags.rawValue, radix: 16))")
             }
         case .keyDown:
             if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { break }
             let code = event.getIntegerValueField(.keyboardEventKeycode)
-            if isHeld {
-                onCombo?()
+            if isHeld && !isForeign(event) {
+                onCombo?("key \(code) flags 0x\(String(event.flags.rawValue, radix: 16))")
             } else if let onKey = onKey, onKey(code) {
                 return nil
             }
@@ -79,6 +80,14 @@ final class HotkeyMonitor {
         case .rightCommand: return raw & 0x10 != 0     // NX_DEVICERCMDKEYMASK
         case .fn: return flags.contains(.maskSecondaryFn)
         }
+    }
+
+    /// Synthetic events posted by other apps. Punto Switcher, for one, answers a lone Option
+    /// release with Cmd+C; that must not count as "the user typed Option+key".
+    /// Hardware (and Karabiner's virtual keyboard) events carry source pid 0.
+    private func isForeign(_ event: CGEvent) -> Bool {
+        let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
+        return pid != 0 && pid != Int64(getpid())
     }
 
     /// Called after a hotkey switch so a half-pressed old key cannot leave us "held".

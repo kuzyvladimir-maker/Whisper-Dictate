@@ -1,3 +1,4 @@
+import AVFoundation
 import Cocoa
 
 // Command-line entry points (no menu bar):
@@ -74,9 +75,9 @@ enum CLI {
     private static func bench(files: [String], models: [String], mode: DictationMode, cold: Bool,
                               format: String) -> Int32 {
         guard let c = client() else { return 2 }
-        let chain = models.isEmpty ? Settings.shared.models : models
         let system = Prompts.system(mode: mode, dictionary: UserDictionary.load())
-        print("arch=\(machineArch()) keys=\(c.keyCount) models=\(chain.joined(separator: ",")) mode=\(mode.rawValue) format=\(format) warm=\(!cold)")
+        let route = models.isEmpty ? "auto (\(Settings.shared.fastModel) < \(Int(Settings.shared.longAudioSeconds))s ≤ \(Settings.shared.model))" : models.joined(separator: ",")
+        print("arch=\(machineArch()) keys=\(c.keyCount) models=\(route) mode=\(mode.rawValue) format=\(format) warm=\(!cold)")
         var totals: [Double] = []
         for path in files {
             let url = URL(fileURLWithPath: path)
@@ -86,6 +87,7 @@ enum CLI {
                 continue
             }
             let seconds = Double(samples.count) / Recorder.sampleRate
+            let chain = models.isEmpty ? Settings.shared.models(mode: mode, seconds: seconds) : models
             if !cold {
                 c.warmUp()
                 Thread.sleep(forTimeInterval: 1.0)
@@ -162,7 +164,11 @@ enum CLI {
         }
         print("arch=\(machineArch()) macOS=\(ProcessInfo.processInfo.operatingSystemVersionString)")
 
-        let tone = (0..<16000).map { Int16(8000 * sin(Double($0) * 2 * .pi * 440 / 16000)) }
+        var tone = [Int16](repeating: 0, count: 16000)
+        for n in 0..<tone.count {
+            let phase: Double = Double(n) * 2.0 * Double.pi * 440.0 / 16000.0
+            tone[n] = Int16(8000.0 * Foundation.sin(phase))
+        }
         let wav = Audio.wav(tone)
         check("wav header", wav.count == 44 + 32000 && wav.prefix(4) == Data("RIFF".utf8))
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("wdl-selftest-\(UUID().uuidString).wav")
@@ -190,12 +196,30 @@ enum CLI {
         check("clean quotes", Prompts.clean("«Привет»", mode: .normal) == "Привет")
         check("clean fence", Prompts.clean("```\nhello\n```", mode: .normal) == "hello")
         check("clean silence", Prompts.clean("(тишина)", mode: .normal) == "")
+        let short = Settings.shared.models(mode: .normal, seconds: 5)
+        let long = Settings.shared.models(mode: .normal, seconds: 60)
+        let email = Settings.shared.models(mode: .email, seconds: 5)
+        check("model routing", short.first == Settings.shared.fastModel && long.first == Settings.shared.model
+              && email.first == Settings.shared.model && !short.contains(where: Settings.isRetired),
+              "короткая → \(short.joined(separator: " → ")); длинная/письмо → \(long.joined(separator: " → "))")
+        check("model unavailable detection",
+              GeminiClient.modelUnavailable("models/gemini-2.5-flash is no longer available to new users"))
+        check("whisper hallucination filter", LocalWhisper.isHallucination("Продолжение следует...")
+              && !LocalWhisper.isHallucination("Спасибо за просмотр, давай теперь обсудим цену и сроки поставки для Walmart"))
 
         let keys = Env.loadKeys()
         check("gemini keys", !keys.isEmpty, keys.isEmpty ? "нет (\(Paths.envFile.path))" : "найдено: \(keys.count)")
         let local = LocalWhisper().locate()
         print("info whisper.cpp fallback: \(local.map { "\($0.cli) + \(($0.model as NSString).lastPathComponent)" } ?? "не установлен")")
         print("info accessibility granted: \(AXIsProcessTrusted())")
+        let mic: String
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: mic = "разрешён"
+        case .denied: mic = "запрещён"
+        case .restricted: mic = "ограничен"
+        default: mic = "ещё не спрашивали"
+        }
+        print("info microphone: \(mic)")
         return ok ? 0 : 1
     }
 }

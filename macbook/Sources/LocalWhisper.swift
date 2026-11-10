@@ -92,7 +92,23 @@ final class LocalWhisper {
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty && !($0.hasPrefix("[") && $0.hasSuffix("]")) }
                 .joined(separator: " ")
-            completion(.success(text))
+            completion(.success(LocalWhisper.isHallucination(text) ? "" : text))
         }
+    }
+
+    /// Whisper invents these on silence or noise. A result is dropped only when it is nothing but
+    /// such phrases (plus a name or two); real sentences containing the words are kept.
+    static func isHallucination(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        guard lower.count < 80 else { return false }
+        let markers = ["dimatorzok", "amara.org", "продолжение следует", "спасибо за просмотр",
+                       "субтитры сделал", "субтитры делал", "субтитры создавал", "редактор субтитров",
+                       "корректор субтитров", "подписывайтесь на канал", "thank you for watching",
+                       "thanks for watching"]
+        var rest = lower
+        for m in markers { rest = rest.replacingOccurrences(of: m, with: "") }
+        guard rest != lower else { return false }
+        let letters = rest.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        return letters < 12
     }
 }

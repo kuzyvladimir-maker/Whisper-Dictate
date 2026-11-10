@@ -97,7 +97,15 @@ ENV
     install_local "$local_dir"
   fi
 
-  # 7. Автозапуск при входе.
+  # 7. Fn — клавиша диктовки: убираем системное действие Fn/🌐 (смена раскладки, эмодзи),
+  #    иначе оно срабатывает на каждое отпускание. Вернуть: Настройки → Клавиатура.
+  local fn_note=""
+  if [ "$(defaults read com.apple.HIToolbox AppleFnUsageType 2>/dev/null || echo unset)" != "0" ]; then
+    defaults write com.apple.HIToolbox AppleFnUsageType -int 0
+    fn_note="Системное действие клавиши Fn/🌐 выключено («Ничего не делать»), чтобы Fn работала для диктовки."
+  fi
+
+  # 8. Автозапуск при входе.
   mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
   cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -118,7 +126,7 @@ PLIST
     launchctl bootstrap "gui/$(id -u)" "$plist"
   fi
 
-  # 8. Итог.
+  # 9. Итог.
   local keys_state="НЕТ — впишите ключ (см. ниже)"
   if grep -Eq '^[[:space:]]*(export[[:space:]]+)?GEMINI_API_KEYS?=[^[:space:]]' "$conf_dir/env"; then
     keys_state="есть"
@@ -133,8 +141,10 @@ PLIST
   say "  2. macOS спросит доступ к микрофону → Разрешить."
   say "  3. Ключ: откройте $conf_dir/env и впишите GEMINI_API_KEY=ключ1,ключ2"
   say "     затем меню значка → «Перечитать ключи и словарь»."
-  say "  4. Держите правый ⌥ Option и говорите, отпустите — текст вставится."
+  say "  4. Держите Fn и говорите, отпустите — текст вставится."
   say "     Короткое нажатие — запись до следующего нажатия. Esc — отмена."
+  say "     Другая клавиша (правый ⌘ или правый ⌥) — в меню значка."
+  if [ -n "$fn_note" ]; then say ""; say "$fn_note"; fi
   say ""
   say "Проверка: \"$app/Contents/MacOS/WhisperDictateLite\" --selftest"
 }
