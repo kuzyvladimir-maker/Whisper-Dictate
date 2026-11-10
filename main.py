@@ -19,7 +19,7 @@ from pathlib import Path
 import rumps
 from PyObjCTools import AppHelper
 
-from cleaner import TextCleaner
+from cleaner import MODES, TextCleaner
 from live_chunker import LiveChunker
 from paste import ClipboardPaste, notify, play_sound
 from recorder import AudioRecorder
@@ -368,12 +368,20 @@ class WhisperDictateApp(rumps.App):
         self._cleanup_items: dict[str, rumps.MenuItem] = {}
         for key, label in (
             ("off", "Выключено (быстро, как есть)"),
+            ("gemini", "Gemini (~1с, уходит только текст, аудио остаётся на Маке)"),
             ("claude", "Claude на каждое сообщение (по подписке, +10-20с)"),
         ):
             item = rumps.MenuItem(label, callback=self._pick_cleanup_backend)
             self._cleanup_items[key] = item
             self.cleanup_menu.add(item)
         self._apply_cleanup_states()
+        self.mode_menu = rumps.MenuItem("✍️ Режим текста (для Gemini)")
+        self._mode_items: dict[str, rumps.MenuItem] = {}
+        for key, label in MODES.items():
+            item = rumps.MenuItem(label, callback=self._pick_mode)
+            self._mode_items[key] = item
+            self.mode_menu.add(item)
+        self._apply_mode_states()
 
         # History of recent dictations, right in the menu bar: click any entry to
         # copy it back to the clipboard. So a thought is never lost -- you can
@@ -393,6 +401,7 @@ class WhisperDictateApp(rumps.App):
             rumps.MenuItem("✨ Причесать последнее и скопировать", callback=self.cleanup_last),
             None,
             self.cleanup_menu,
+            self.mode_menu,
             self.toggle_paste_item,
             rumps.MenuItem("Открыть словарь", callback=self.open_dictionary),
             rumps.MenuItem(
@@ -914,6 +923,8 @@ class WhisperDictateApp(rumps.App):
             # Metal drops residency after ~3 min idle, which made the first
             # dictation after a break feel much slower.
             threading.Thread(target=self._warm_whisper, daemon=True).start()
+            # Open the HTTPS connection for the cleanup pass while the user talks.
+            threading.Thread(target=self.cleaner.warmup, daemon=True).start()
             # Живая расшифровка: куски длинной диктовки уходят в whisper прямо
             # во время записи, чтобы после отпускания остался только хвост.
             self.live_chunker = None
@@ -1167,6 +1178,7 @@ class WhisperDictateApp(rumps.App):
             if self.state != "recording":
                 return
             # Immediate "recording stopped" cue the moment the key is released.
+            t_release = time.monotonic()
             self._beep("stop")
             AppHelper.callAfter(self._hide_hud)
             self._cancel_timer("max_duration_timer")
@@ -1214,16 +1226,25 @@ class WhisperDictateApp(rumps.App):
                     cleaned, used = self.cleaner.clean(text)
                     if used is not None:
                         text = cleaned
-                        log(f"cleanup ({used}): {time.monotonic() - t_clean:.1f}s")
+                        model = f" {self.cleaner.last_model}" if used == "gemini" else ""
+                        log(f"cleanup ({used}{model}, {self.cleaner.mode}): {time.monotonic() - t_clean:.1f}s")
+                    else:
+                        log(f"cleanup skipped/failed: {time.monotonic() - t_clean:.1f}s, raw text kept")
                 if text:
                     # Save first: the thought is preserved on disk, in the
                     # menu-bar history, and on the clipboard BEFORE we attempt the
                     # (fallible) auto-paste.
                     self.last_transcription = text
                     self._add_to_history(text, audio_path.name)
-                    self.clipboard.copy(text)
                     if bool(self.config.get("paste_after_transcription", True)):
-                        self.clipboard.paste()
+                        self.clipboard.paste_text(
+                            text,
+                            restore=bool(self.config.get("restore_clipboard", True)),
+                            restore_delay=float(self.config.get("restore_clipboard_delay", 0.8)),
+                        )
+                    else:
+                        self.clipboard.copy(text)
+                    log(f"release->paste: {time.monotonic() - t_release:.1f}s")
                     self._update_last_item(text)
                     ok = True
                 else:
@@ -1335,6 +1356,19 @@ class WhisperDictateApp(rumps.App):
                 self.cleaner.backend = key
                 break
         self._apply_cleanup_states()
+        _atomic_write_json(PATHS["user_config"], self.config)
+
+    def _apply_mode_states(self) -> None:
+        current = self.cleaner.mode
+        for key, item in self._mode_items.items():
+            item.state = key == current
+
+    def _pick_mode(self, sender) -> None:
+        for key, item in self._mode_items.items():
+            if item is sender:
+                self.cleaner.mode = key
+                break
+        self._apply_mode_states()
         _atomic_write_json(PATHS["user_config"], self.config)
 
     def cleanup_last(self, _sender) -> None:

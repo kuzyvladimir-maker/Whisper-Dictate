@@ -31,9 +31,15 @@
   "suppress_nst": true,
   "start_beep_delay_builtin": 0.15,
   "live_chunking": true,
-  "cleanup_backend": "off",
+  "cleanup_backend": "gemini",
   "cleanup_min_words": 7,
   "chunk_min_seconds": 40,
   "chunk_max_seconds": 75,
-  "mic_idle_close_seconds": 0
+  "mic_idle_close_seconds": 0,
+  "cleanup_mode": "normal",
+  "cleanup_gemini_model": "gemini-3.6-flash",
+  "cleanup_gemini_fast_model": "gemini-3.5-flash-lite",
+  "cleanup_gemini_long_words": 60,
+  "cleanup_gemini_timeout": 4.0,
+  "restore_clipboard": true
 }
