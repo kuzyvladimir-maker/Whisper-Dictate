@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -98,6 +99,11 @@ class EngineTests(unittest.TestCase):
             result = engine.transcribe_detailed(path)
             self.assertEqual(result.backend, "cli")
             self.assertTrue(result.retried)
+            # The server restarts in a background thread so the dictation is not
+            # charged for the model reload; wait for it.
+            deadline = time.monotonic() + 2.0
+            while server.started < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
             self.assertEqual(server.started, 2)
 
     def test_low_confidence_server_result_is_retried_with_cli(self) -> None:

@@ -32,6 +32,7 @@ class TranscriberTests(unittest.TestCase):
             "Спасибо за просмотр документа, внеси правки.",
             "Продолжение следует отдельным файлом.",
             "Редактор субтитров И.Иванов подготовил пример.",
+            "Подписывай договор с Walmart сегодня, а потом позвони мне.",
         ]
         for phrase in phrases:
             with self.subTest(phrase=phrase):
@@ -39,6 +40,23 @@ class TranscriberTests(unittest.TestCase):
                 self.assertEqual(result.text, phrase)
                 self.assertEqual(result.raw_text, phrase)
                 self.assertIn("possible_whisper_hallucination", result.warnings)
+
+    def test_marker_only_sentences_and_credits_are_cut_from_real_speech(self) -> None:
+        cases = {
+            "Ну всё, до завтра. Продолжение следует...": "Ну всё, до завтра.",
+            "Отправь отчёт. Подписывайтесь на канал!": "Отправь отчёт.",
+            "Готово. Субтитры сделал DimaTorzok": "Готово.",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                result = Transcriber(FakeEngine(raw)).transcribe_result("unused.wav")
+                self.assertEqual(result.text, expected)
+                self.assertEqual(result.raw_text, raw)
+
+    def test_marker_alone_is_suppressed(self) -> None:
+        result = Transcriber(FakeEngine("Продолжение следует...")).transcribe_result("unused.wav")
+        self.assertEqual(result.text, "")
+        self.assertIn("hallucination_suppressed", result.warnings)
 
     def test_repetition_is_flagged_but_preserved(self) -> None:
         phrase = "проверь этот документ проверь этот документ проверь этот документ"

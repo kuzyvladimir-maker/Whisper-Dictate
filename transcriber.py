@@ -4,14 +4,25 @@ import re
 from dataclasses import dataclass
 
 # Subtitle-credit artifacts Whisper's Russian model hallucinates on silence or
-# near-silent / noisy audio (it was trained on YouTube subtitles). These strings
-# are never legitimate dictation, so they are safe to strip. They appear in many
-# forms and often run straight into real speech, so the patterns are surgical:
-# the credit-run pattern only matches "Role [субтитров] И.Фамилия" (an initial +
-# surname, which real sentence words never look like), so it can't eat real text.
-_HALLUCINATIONS = [
+# near-silent / noisy audio (it was trained on YouTube subtitles).
+#
+# Two groups, because several markers are also ordinary Russian:
+# - UNAMBIGUOUS: never legitimate dictation, cut out always, even mid-speech.
+# - AMBIGUOUS: "подписывай", "спасибо за просмотр", "продолжение следует", credit
+#   runs. Real phrases ("Подписывай договор с Walmart...") must survive, so these
+#   are removed only when the audio is silent, or when a whole sentence is
+#   nothing but the marker (Whisper appends "Продолжение следует..." as its own
+#   sentence after real speech).
+_UNAMBIGUOUS_HALLUCINATIONS = [
     re.compile(r"\bDimaTorzok\b", re.IGNORECASE),
     re.compile(r"\bamara\.org\b", re.IGNORECASE),
+    re.compile(
+        r"\bсубтитр[а-яё]*\s+(?:делал|сделал|создал|создавал|подготовил|правил|"
+        r"редактировал|предоставлен\w*)\b[^.!?\n]*[.!?]?",
+        re.IGNORECASE,
+    ),
+]
+_AMBIGUOUS_HALLUCINATIONS = [
     re.compile(r"\bпродолжение следует\b\.{0,3}", re.IGNORECASE),
     re.compile(r"\bспасибо за просмотр\b[^.!?\n]*[.!?]?", re.IGNORECASE),
     re.compile(r"\bподписыва[а-яё]*\b[^.!?\n]*[.!?]?", re.IGNORECASE),
@@ -23,12 +34,25 @@ _HALLUCINATIONS = [
         r"(?:(?:Автор|Авторы|Редактор|Корректор|Переводчик)\s+(?:субтитров\s+)?"
         r"[А-ЯЁA-Z]\.\s?[А-ЯЁA-Z][а-яёa-z]+\s*)+"
     ),
+]
+_HALLUCINATIONS = _UNAMBIGUOUS_HALLUCINATIONS + _AMBIGUOUS_HALLUCINATIONS
+
+# A sentence that is ONLY an ambiguous marker (anchored, whole sentence).
+_MARKER_ONLY_SENTENCES = [
+    re.compile(r"^продолжение следует[.…!]*$", re.IGNORECASE),
+    re.compile(r"^спасибо за (?:просмотр|внимание и просмотр|субтитры)[.…!]*$", re.IGNORECASE),
     re.compile(
-        r"\bсубтитр[а-яё]*\s+(?:делал|сделал|создал|создавал|подготовил|правил|"
-        r"редактировал|предоставлен\w*)\b[^.!?\n]*[.!?]?",
+        r"^(?:ставьте лайки?[,]? )?(?:и )?подписыва[а-яё]*(?: на (?:наш |мой )?канал[а-яё]*)?"
+        r"(?:[,]? (?:и )?ставьте лайки?)?[.…!]*$",
         re.IGNORECASE,
     ),
+    re.compile(r"^добавил[а-яё]*\s+субтитры[.…!]*$", re.IGNORECASE),
+    re.compile(
+        r"^(?:(?:Автор|Авторы|Редактор|Корректор|Переводчик)\s+(?:субтитров\s+)?"
+        r"[А-ЯЁA-Z]\.\s?[А-ЯЁA-Z][а-яёa-z]+\s*)+[.…!]*$"
+    ),
 ]
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
 
 
 @dataclass(frozen=True)
@@ -114,19 +138,21 @@ class Transcriber:
         no_speech = getattr(detailed, "no_speech_probability", None)
         if self._contains_hallucination_marker(text):
             warnings.append("possible_whisper_hallucination")
-            # Subtitle-credit phrases are never legitimate dictation -- cut them
-            # out even when they run into real speech. (The 2026-07-10 rewrite
-            # lost this call and "Продолжение следует..." reached the clipboard.)
-            text = self._strip_hallucinations(text)
-            if not text:
-                warnings.append("hallucination_suppressed")
-            elif (audio_peak is not None and audio_peak < 0.006) or (
+            silent = (audio_peak is not None and audio_peak < 0.006) or (
                 no_speech is not None and no_speech >= 0.80
-            ):
-                # Whatever survived on silent audio is still model fantasy.
+            )
+            if silent:
+                # Marker on silent audio: the whole result is model fantasy.
                 # raw_text remains available in JSONL.
                 text = ""
                 warnings.append("hallucination_suppressed_on_silence")
+            else:
+                # Real speech: cut only unambiguous credits and sentences that are
+                # nothing but a marker. "Подписывай договор..." stays intact.
+                text = self._strip_unambiguous(text)
+                text = self._drop_marker_only_sentences(text)
+                if not text:
+                    warnings.append("hallucination_suppressed")
         elif text and audio_peak is not None and audio_peak < 0.006:
             # The recorder uses the same threshold to classify a whole waveform
             # as room noise. Any confident-looking text from such a file is still
@@ -155,18 +181,31 @@ class Transcriber:
     def _contains_hallucination_marker(text: str) -> bool:
         return any(pattern.search(text) for pattern in _HALLUCINATIONS)
 
-    def _strip_hallucinations(self, text: str) -> str:
-        """Legacy helper kept for explicit/manual recovery workflows only.
-
-        Normal dictation no longer calls this method because several markers
-        (for example, "подписывай" or "спасибо за просмотр") are valid Russian
-        phrases and the old implementation could erase an entire sentence.
-        """
-        for pattern in _HALLUCINATIONS:
-            text = pattern.sub("", text)
+    @staticmethod
+    def _tidy(text: str) -> str:
         text = re.sub(r"\s+", " ", text)
         text = re.sub(r"^\s*[,.!?;:—-]+\s*", "", text)  # leftover leading punctuation
         return text.strip()
+
+    def _strip_unambiguous(self, text: str) -> str:
+        for pattern in _UNAMBIGUOUS_HALLUCINATIONS:
+            text = pattern.sub("", text)
+        return self._tidy(text)
+
+    def _drop_marker_only_sentences(self, text: str) -> str:
+        kept = [
+            sentence for sentence in _SENTENCE_SPLIT.split(text)
+            if not any(p.match(sentence.strip()) for p in _MARKER_ONLY_SENTENCES)
+        ]
+        return self._tidy(" ".join(kept))
+
+    def _strip_hallucinations(self, text: str) -> str:
+        """Strip every marker, ambiguous ones included. Destructive: "Подписывай
+        договор..." loses the whole sentence. Kept for manual recovery only;
+        finalize_raw uses _strip_unambiguous + _drop_marker_only_sentences."""
+        for pattern in _HALLUCINATIONS:
+            text = pattern.sub("", text)
+        return self._tidy(text)
 
     def _clean(self, text: str) -> str:
         text = text.strip()
