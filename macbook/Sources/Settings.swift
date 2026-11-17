@@ -71,13 +71,14 @@ final class Settings {
     var holdThreshold = 0.35
     var maxRecordingSeconds = 600.0
     // Free tier (Nov 2026): 3.6-flash 5/min, 20/day per project; 3.5-flash-lite 15/min, 500/day.
-    // So flash-lite carries everyday short phrases; flash is spent on long dictations and on the
-    // "письмо" / "код" modes where the extra quality matters.
+    // flash-lite carries everyday short phrases AND long dictations (3.6-flash stalls on long
+    // audio); the heavy flash model is spent on the short "письмо" / "код" modes where the
+    // extra quality matters, and stays a backup elsewhere.
     static let defaultModel = "gemini-3.6-flash"
     static let defaultFastModel = "gemini-3.5-flash-lite"
-    var model = Settings.defaultModel           // long audio, email and code modes
-    var fastModel = Settings.defaultFastModel   // short phrases in normal mode
-    var longAudioSeconds = 30.0
+    var model = Settings.defaultModel           // email and code modes on short audio
+    var fastModel = Settings.defaultFastModel   // short phrases in normal mode + all long audio
+    var longAudioSeconds = 20.0
     var fallbackModels: [String] = []
     var language = "ru"
     var audioFormat = "aac"   // "aac" (smaller upload) or "wav"
@@ -90,11 +91,15 @@ final class Settings {
     /// a 404 ("no longer available") skips the model. Defaults go last so a stale config
     /// still ends up on a working model.
     func models(mode: DictationMode, seconds: Double) -> [String] {
-        let wantsQuality = mode != .normal || seconds >= longAudioSeconds
+        // Длинное аудио (>= longAudioSeconds): 3.6-flash на длинных записях иногда висит
+        // до таймаута, а flash-lite отвечает за секунды — поэтому для длинных ведём lite
+        // первой, тяжёлую модель оставляем лишь запасной. Короткие фразы в обычном режиме
+        // тоже идут через lite; письмо/код на короткой записи — через качественную модель.
+        let longAudio = seconds >= longAudioSeconds
+        let wantsQuality = mode != .normal && !longAudio
         var chain = wantsQuality ? [model, fastModel] : [fastModel, model]
         chain += fallbackModels
-        chain += wantsQuality ? [Settings.defaultModel, Settings.defaultFastModel]
-                              : [Settings.defaultFastModel, Settings.defaultModel]
+        chain += [Settings.defaultFastModel, Settings.defaultModel]
         var out: [String] = []
         for m in chain where !m.isEmpty && !Settings.isRetired(m) && !out.contains(m) { out.append(m) }
         return out

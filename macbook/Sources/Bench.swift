@@ -78,7 +78,7 @@ enum CLI {
         guard let c = client() else { return 2 }
         UserDictionary.shared.refresh()
         let system = Prompts.system(mode: mode, dictionary: UserDictionary.shared.entries(for: nil))
-        let route = models.isEmpty ? "auto (\(Settings.shared.fastModel) < \(Int(Settings.shared.longAudioSeconds))s ≤ \(Settings.shared.model))" : models.joined(separator: ",")
+        let route = models.isEmpty ? "auto (\(Settings.shared.fastModel) для длинных ≥\(Int(Settings.shared.longAudioSeconds))s и коротких в обычном; \(Settings.shared.model) для короткого письма/кода)" : models.joined(separator: ",")
         print("arch=\(machineArch()) keys=\(c.keyCount) models=\(route) mode=\(mode.rawValue) format=\(format) warm=\(!cold)")
         var totals: [Double] = []
         for path in files {
@@ -228,9 +228,13 @@ enum CLI {
         let short = Settings.shared.models(mode: .normal, seconds: 5)
         let long = Settings.shared.models(mode: .normal, seconds: 60)
         let email = Settings.shared.models(mode: .email, seconds: 5)
-        check("model routing", short.first == Settings.shared.fastModel && long.first == Settings.shared.model
-              && email.first == Settings.shared.model && !short.contains(where: Settings.isRetired),
-              "короткая → \(short.joined(separator: " → ")); длинная/письмо → \(long.joined(separator: " → "))")
+        let longEmail = Settings.shared.models(mode: .email, seconds: 60)
+        // Длинное аудио (в любом режиме) ведёт flash-lite — 3.6-flash на длинном висит;
+        // короткое письмо/код — качественной моделью. Тяжёлая модель остаётся в хвосте запасной.
+        check("model routing", short.first == Settings.shared.fastModel && long.first == Settings.shared.fastModel
+              && email.first == Settings.shared.model && longEmail.first == Settings.shared.fastModel
+              && long.contains(Settings.shared.model) && !short.contains(where: Settings.isRetired),
+              "короткая → \(short.joined(separator: " → ")); длинная → \(long.joined(separator: " → ")); письмо → \(email.joined(separator: " → "))")
         check("model unavailable detection",
               GeminiClient.modelUnavailable("models/gemini-2.5-flash is no longer available to new users"))
         check("whisper hallucination filter", LocalWhisper.isHallucination("Продолжение следует...")

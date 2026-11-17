@@ -274,7 +274,9 @@ final class GeminiClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(keys[keyIndex], forHTTPHeaderField: "x-goog-api-key")
-        req.timeoutInterval = 25 + job.audioSeconds * 0.5
+        // Не ждём один ответ слишком долго: длинная запись не должна висеть минуту —
+        // hedge на flash-lite и перебор пар подхватят раньше. Потолок 30 с.
+        req.timeoutInterval = min(30, 12 + job.audioSeconds * 0.3)
         req.httpBody = payload
         let t0 = Date()
         session.dataTask(with: req) { data, response, error in
@@ -294,9 +296,18 @@ final class GeminiClient {
         if let error = error {
             let code = (error as NSError).code
             Log.write("gemini \(tag): network error \(code) after \(fmt(seconds))s")
-            // A stale pooled connection dies with "connection lost": just try the next pair.
-            if code == NSURLErrorNetworkConnectionLost {
-                job.lastError = .network(error.localizedDescription)
+            job.lastError = .network(error.localizedDescription)
+            // Таймаут или обрыв соединения на одной паре (model, key) — не приговор:
+            // пробуем следующий ключ, затем flash-lite (длинное аудио иногда «вешает»
+            // 3.6-flash, а flash-lite отвечает быстро). Перебрав несколько пар, отдаём
+            // ошибку наверх, где включается локальный whisper — текст не теряется.
+            let transient = code == NSURLErrorTimedOut
+                || code == NSURLErrorNetworkConnectionLost
+                || code == NSURLErrorCannotConnectToHost
+                || code == NSURLErrorCannotFindHost
+                || code == NSURLErrorDNSLookupFailed
+                || code == NSURLErrorResourceUnavailable
+            if transient && job.attempts < 4 {
                 job.retryOrWait()
             } else {
                 job.fail(.network(error.localizedDescription))
