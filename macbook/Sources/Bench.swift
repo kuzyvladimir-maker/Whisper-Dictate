@@ -78,7 +78,7 @@ enum CLI {
         guard let c = client() else { return 2 }
         UserDictionary.shared.refresh()
         let system = Prompts.system(mode: mode, dictionary: UserDictionary.shared.entries(for: nil))
-        let route = models.isEmpty ? "auto (\(Settings.shared.fastModel) для длинных ≥\(Int(Settings.shared.longAudioSeconds))s и коротких в обычном; \(Settings.shared.model) для короткого письма/кода)" : models.joined(separator: ",")
+        let route = models.isEmpty ? "auto (\(Settings.shared.fastModel) во всех режимах; \(Settings.shared.model) запасная)" : models.joined(separator: ",")
         print("arch=\(machineArch()) keys=\(c.keyCount) models=\(route) mode=\(mode.rawValue) format=\(format) warm=\(!cold)")
         var totals: [Double] = []
         for path in files {
@@ -232,7 +232,7 @@ enum CLI {
         // Длинное аудио (в любом режиме) ведёт flash-lite — 3.6-flash на длинном висит;
         // короткое письмо/код — качественной моделью. Тяжёлая модель остаётся в хвосте запасной.
         check("model routing", short.first == Settings.shared.fastModel && long.first == Settings.shared.fastModel
-              && email.first == Settings.shared.model && longEmail.first == Settings.shared.fastModel
+              && email.first == Settings.shared.fastModel && longEmail.first == Settings.shared.fastModel
               && long.contains(Settings.shared.model) && !short.contains(where: Settings.isRetired),
               "короткая → \(short.joined(separator: " → ")); длинная → \(long.joined(separator: " → ")); письмо → \(email.joined(separator: " → "))")
         check("model unavailable detection",
@@ -250,6 +250,18 @@ enum CLI {
         check("recordings prune keeps N", kept.count == 3, "осталось \(kept.count)")
         check("recordings latest is newest", RecordingStore.latest(in: recDir)?.lastPathComponent == "rec-2026-05.wav",
               RecordingStore.latest(in: recDir)?.lastPathComponent ?? "nil")
+
+        if let latest = RecordingStore.latest(in: recDir) {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: latest.path)
+            check("recording mode 0600", (attrs?[.posixPermissions] as? NSNumber)?.intValue == 0o600)
+            let restored = try? Audio.load(latest)
+            check("recording reload after restart", restored == clip)
+        }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: recDir.path)
+        check("recording directory mode 0700", (attrs?[.posixPermissions] as? NSNumber)?.intValue == 0o700)
+        _ = RecordingStore.save(clip, keep: 0, in: recDir)
+        check("recording retention disabled", !RecordingStore.hasAny(in: recDir))
+        for (name, passed) in SelftestURLProtocol.run() { check(name, passed) }
 
         let keys = Env.loadKeys()
         check("gemini keys", !keys.isEmpty, keys.isEmpty ? "нет (\(Paths.envFile.path))" : "найдено: \(keys.count)")

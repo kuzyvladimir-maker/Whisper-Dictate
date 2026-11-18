@@ -75,7 +75,7 @@ main() {
   # сбрасывать их НЕ нужно. Без неё (ad-hoc) подпись каждый раз новая, поэтому сбрасываем, чтобы
   # macOS спросила заново (иначе галочка стоит, но не работает).
   local stable_sign=0
-  if security find-identity -v -p codesigning 2>/dev/null | grep -q "Whisper Dictate Lite Self-Signed"; then
+  if codesign -dv "$app" 2>&1 | grep -q '^Authority='; then
     stable_sign=1
   fi
   if [ "$upgrading" = 1 ] && [ "$stable_sign" = 0 ]; then
@@ -158,7 +158,7 @@ PLIST
     say "Совет: чтобы после каждого обновления не выдавать заново «Универсальный доступ» и"
     say "       «Микрофон», один раз выполните (в обычной сессии, не по SSH):"
     say "         bash \"$src/make-signing-identity.sh\""
-    say "       Дальше установки будут подписываться устойчиво и разрешения сохранятся."
+    say "       Дальше установки будут использовать ту же identity; сохранение разрешений проверьте после обновления."
   fi
 }
 

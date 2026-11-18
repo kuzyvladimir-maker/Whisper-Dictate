@@ -1,7 +1,7 @@
 import AVFoundation
 
 // Microphone capture straight into memory as 16 kHz mono Int16 — the format both Gemini
-// and whisper.cpp want. Nothing is written to disk.
+// and whisper.cpp want. The app archives completed captures through RecordingStore.
 
 enum RecorderError: Error, LocalizedError {
     case noInput
@@ -61,9 +61,13 @@ final class Recorder {
             samples = seed
             samples.reserveCapacity(Int(Recorder.sampleRate) * 30)
             peak = seed.reduce(Int16(0)) { max($0, $1 == Int16.min ? Int16.max : abs($1)) }
+            capturing = true
             lock.unlock()
             if engine == nil || engine?.isRunning == false {
-                try openEngine()
+                do { try openEngine() } catch {
+                    lock.lock(); capturing = false; lock.unlock()
+                    throw error
+                }
             }
             lock.lock()
             if !seed.isEmpty {
@@ -123,15 +127,14 @@ final class Recorder {
         // Input device changed (AirPods, display mic): rebuild with the new format.
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
-        ) { [weak self] _ in
+        ) { [weak self, weak engine] _ in
             guard let self = self else { return }
             self.queue.async {
+                guard let engine = engine, self.engine === engine else { return }
                 Log.write("audio device changed, reopening mic")
-                let wasCapturing: Bool = { self.lock.lock(); defer { self.lock.unlock() }; return self.capturing }()
-                if wasCapturing {
-                    try? self.openEngine()
-                } else {
-                    self.closeEngine()
+                // Preserve the idle warm-up window as well as captured samples.
+                do { try self.openEngine() } catch {
+                    Log.write("mic reopen failed; captured audio retained: \(error.localizedDescription)")
                 }
             }
         }
@@ -150,6 +153,7 @@ final class Recorder {
         lock.lock()
         converter = nil
         level = 0
+        preRoll = []
         lock.unlock()
         Log.write("mic closed")
     }

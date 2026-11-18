@@ -54,8 +54,8 @@ final class GeminiClient {
 
     let host = "https://generativelanguage.googleapis.com"
 
-    init() {
-        let cfg = URLSessionConfiguration.ephemeral
+    init(configuration: URLSessionConfiguration = .ephemeral) {
+        let cfg = configuration
         cfg.httpMaximumConnectionsPerHost = 4
         cfg.timeoutIntervalForRequest = 60
         cfg.timeoutIntervalForResource = 600
@@ -68,6 +68,8 @@ final class GeminiClient {
     var keyCount: Int { q.sync { keys.count } }
 
     func setKeys(_ newKeys: [String]) {
+        var seen = Set<String>()
+        let newKeys = newKeys.filter { !$0.isEmpty && seen.insert($0).inserted }
         q.sync {
             if newKeys != keys {
                 keys = newKeys
@@ -130,7 +132,7 @@ final class GeminiClient {
         // heavy model (short email/code) we wait, so a duplicate does not burn its 20/day.
         var hedgeDelay: Double {
             let primaryCheap = models.first?.contains("lite") ?? false
-            return primaryCheap ? 0.05 : (1.0 + audioSeconds * 0.02)
+            return primaryCheap ? 0 : (1.0 + audioSeconds * 0.02)
         }
 
         func complete(_ result: Result<GeminiResult, GeminiError>) {
@@ -179,7 +181,11 @@ final class GeminiClient {
             client.send(model: model, keyIndex: idx, job: self)
             if !hedgeScheduled {
                 hedgeScheduled = true
-                client.q.asyncAfter(deadline: .now() + hedgeDelay) { [self] in self.hedge() }
+                if hedgeDelay == 0 {
+                    hedge()
+                } else {
+                    client.q.asyncAfter(deadline: .now() + hedgeDelay) { [self] in self.hedge() }
+                }
             }
         }
 

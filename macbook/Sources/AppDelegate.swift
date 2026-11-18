@@ -33,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastText: String?
     private var pendingAudio: [Int16]?
     private var failedAudio: [Int16]?
+    private var unsavedAudio: [Int16]?
     private var lastInfo = ""
     private var flash: String?
     private var sounds: [String: NSSound] = [:]
@@ -216,14 +217,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func stopAndProcess(released: Date) {
         state = .processing
+        processingSince = Date()
         play("stop")
         updateIcon()
         let my = session
+        let keep = settings.recordingsKept
         audioQueue.async {
             let (samples, peak) = self.recorder.stop()
             Log.write("recording stopped: \(fmt(Double(samples.count) / Recorder.sampleRate))s, peak \(fmt(Double(peak)))")
+            let saved = RecordingStore.save(samples, keep: keep)
             DispatchQueue.main.async {
                 guard my == self.session else { return }
+                self.unsavedAudio = keep > 0 && saved == nil ? samples : nil
+                if keep > 0 && !samples.isEmpty && saved == nil {
+                    self.failedAudio = samples
+                    self.showError("Не удалось сохранить запись на диск; до выхода она доступна в памяти")
+                }
                 self.process(samples: samples, peak: peak, released: released)
             }
         }
@@ -265,9 +274,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         processingSince = Date()
         pendingAudio = samples
         updateIcon()
-        // Persist to disk before the network call so a crash or restart never loses the dictation.
-        let keep = settings.recordingsKept
-        audioQueue.async { RecordingStore.save(samples, keep: keep) }
         let token = session
         let mode = settings.mode
 
@@ -549,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectHotkey(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let h = HotkeyChoice(rawValue: raw) else { return }
-        if isRecording { cancelRecording(silent: true) }
+        if isRecording || state == .finishing { cancelRecording(silent: true) }
         settings.hotkey = h
         settings.save()
         hotkey.choice = h
@@ -581,13 +587,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func retryFailed() {
         guard state == .idle else { return }
-        // Prefer the in-memory failure; fall back to the newest recording on disk (survives a restart).
-        var samples = failedAudio
+        // Disk is authoritative across launches; memory is a fallback if the archive is unavailable.
+        var samples = unsavedAudio
         if samples == nil, let url = RecordingStore.latest() {
             samples = try? Audio.load(url)
             if samples == nil { Log.write("retry: can't read \(url.lastPathComponent)") }
         }
-        guard let audio = samples, !audio.isEmpty else { return }
+        guard let audio = samples ?? failedAudio, !audio.isEmpty else { return }
         session += 1
         state = .processing
         process(samples: audio, peak: Audio.peak(audio), released: Date())

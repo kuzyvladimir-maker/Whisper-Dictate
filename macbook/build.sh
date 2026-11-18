@@ -57,7 +57,7 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
-  <key>NSMicrophoneUsageDescription</key><string>Запись голоса для диктовки. Аудио не сохраняется.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Запись голоса для диктовки. Последние 20 записей сохраняются локально для повторной отправки.</string>
 </dict>
 </plist>
 PLIST
@@ -72,7 +72,7 @@ if [ -z "$SIGN_ID" ] && security find-identity -v -p codesigning 2>/dev/null \
 fi
 if [ -n "$SIGN_ID" ]; then
   codesign --force --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$OUT" >/dev/null
-  echo "Подпись: устойчивая identity «$SIGN_ID» (разрешения переживут обновление)."
+  echo "Подпись: устойчивая identity «$SIGN_ID» (сохранение разрешений нужно проверить на целевом Mac)."
 else
   codesign --force --sign - --identifier "$BUNDLE_ID" "$OUT" >/dev/null
   echo "Подпись: ad-hoc (разрешения слетят при обновлении; см. make-signing-identity.sh)."
