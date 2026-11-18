@@ -23,7 +23,7 @@ enum CLI {
         while i < args.count {
             let a = args[i]
             switch a {
-            case "--bench", "--list-models", "--selftest", "--mic-test": command = a
+            case "--bench", "--list-models", "--selftest", "--mic-test", "--aac-check": command = a
             case "--model":
                 i += 1
                 if i < args.count { models.append(args[i]) }
@@ -54,6 +54,7 @@ enum CLI {
         switch command {
         case "--selftest": return selftest()
         case "--mic-test": return micTest()
+        case "--aac-check": return aacCheck(files)
         case "--list-models": return listModels()
         case "--bench" where useLocal: return benchLocal(files: files)
         case "--bench": return bench(files: files, models: models, mode: mode, cold: cold, format: format, opts: opts)
@@ -193,6 +194,35 @@ enum CLI {
         return 0
     }
 
+    /// Does AAC encoding keep the END of the audio? Encodes in memory, decodes back and
+    /// compares the energy of the last 50 ms windows (numbers only, no audio leaves).
+    private static func aacCheck(_ files: [String]) -> Int32 {
+        func tailRMS(_ s: [Int16], windows: Int) -> [String] {
+            let win = 800
+            return (1...windows).reversed().map { k -> String in
+                let end = s.count - (k - 1) * win, start = max(0, end - win)
+                guard end > start else { return "-" }
+                var acc = 0.0
+                for v in s[start..<end] { acc += Double(v) * Double(v) }
+                return String(format: "%.3f", (acc / Double(end - start)).squareRoot() / 32768)
+            }
+        }
+        for path in files {
+            guard let pcm = try? Audio.load(URL(fileURLWithPath: path)), let aac = Audio.aac(pcm) else { continue }
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("wdl-aac-\(UUID().uuidString).aac")
+            defer { try? FileManager.default.removeItem(at: tmp) }
+            guard (try? aac.write(to: tmp)) != nil, let back = try? Audio.load(tmp) else { continue }
+            print(String(format: "%@: pcm %d samples, aac-decoded %d (+%d)", (path as NSString).lastPathComponent,
+                         pcm.count, back.count, back.count - pcm.count))
+            print("   pcm  last 6x50ms: " + tailRMS(pcm, windows: 6).joined(separator: " "))
+            // Decoded stream = encoder priming (2112) + audio + padding: align on the priming offset.
+            let aligned = Array(back.dropFirst(2112).prefix(pcm.count))
+            print("   aac  last 6x50ms: " + tailRMS(aligned, windows: 6).joined(separator: " ")
+                  + String(format: "  (aligned %d of %d)", aligned.count, pcm.count))
+        }
+        return 0
+    }
+
     /// Two short captures in a row: the second must reuse the open engine (no "mic opened"
     /// in between). No hotkeys involved.
     private static func micTest() -> Int32 {
@@ -205,8 +235,8 @@ enum CLI {
             }
             Thread.sleep(forTimeInterval: 1.5)
             let (samples, peak) = r.stop()
-            print(String(format: "capture %d: %.2fs, peak %.3f, live level %.3f", i,
-                         Double(samples.count) / Recorder.sampleRate, peak, r.currentLevel))
+            print(String(format: "capture %d: %.2fs, peak %.3f, live level %.3f, audio lag at stop %.0f ms", i,
+                         Double(samples.count) / Recorder.sampleRate, peak, r.currentLevel, r.lastDrain.lagMs))
             Thread.sleep(forTimeInterval: 0.3)
         }
         Thread.sleep(forTimeInterval: 2.5)   // idle close fires

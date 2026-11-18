@@ -224,7 +224,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let keep = settings.recordingsKept
         audioQueue.async {
             let (samples, peak) = self.recorder.stop()
-            Log.write("recording stopped: \(fmt(Double(samples.count) / Recorder.sampleRate))s, peak \(fmt(Double(peak)))")
+            let drain = self.recorder.lastDrain
+            Log.write("recording stopped: \(fmt(Double(samples.count) / Recorder.sampleRate))s, peak \(fmt(Double(peak))), "
+                      + String(format: "audio lag at stop %.0f ms", drain.lagMs))
             let saved = RecordingStore.save(samples, keep: keep)
             DispatchQueue.main.async {
                 guard my == self.session else { return }

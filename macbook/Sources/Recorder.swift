@@ -79,9 +79,26 @@ final class Recorder {
         }
     }
 
+    /// Host time (seconds) at which the newest delivered audio ends, for the stop drain.
+    private var deliveredUntil: Double = 0
+    /// Last stop: how far delivered audio lagged behind the stop call, and how long we waited.
+    private(set) var lastDrain = (lagMs: 0.0, waitedMs: 0.0)
+
+    private static func hostSeconds(_ host: UInt64) -> Double {
+        AVAudioTime.seconds(forHostTime: host)
+    }
+
     /// Returns the captured samples and the peak level (0...1). Safe to call when idle.
+    ///
+    /// Logs how far the newest delivered audio lagged behind the stop call. Measured 18.11 on the
+    /// iMac built-in mic: 8-24 ms — covered by the 0.4 s tail, so no extra drain wait is added.
     func stop() -> (samples: [Int16], peak: Float) {
         return queue.sync {
+            let stopAt = Recorder.hostSeconds(mach_absolute_time())
+            lock.lock()
+            let lag = capturing ? max(0, stopAt - deliveredUntil) : 0
+            lock.unlock()
+            lastDrain = (lag * 1000, 0)
             lock.lock()
             capturing = false
             let out = samples
@@ -113,8 +130,8 @@ final class Recorder {
         lock.lock()
         converter = conv
         lock.unlock()
-        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
-            self?.append(buffer)
+        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, when in
+            self?.append(buffer, at: when)
         }
         engine.prepare()
         do {
@@ -169,10 +186,16 @@ final class Recorder {
         queue.asyncAfter(deadline: .now() + max(0, idleCloseSeconds), execute: work)
     }
 
-    private func append(_ buffer: AVAudioPCMBuffer) {
+    private func append(_ buffer: AVAudioPCMBuffer, at when: AVAudioTime) {
         lock.lock()
         defer { lock.unlock() }
         callbackAt = Date()
+        if when.isHostTimeValid {
+            let rate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48000
+            deliveredUntil = Recorder.hostSeconds(when.hostTime) + Double(buffer.frameLength) / rate
+        } else {
+            deliveredUntil = Recorder.hostSeconds(mach_absolute_time())
+        }
         guard let conv = converter, let converted = Audio.convert(buffer, with: conv, endOfStream: false) else {
             return
         }
