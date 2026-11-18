@@ -41,6 +41,13 @@ class GeminiClientTests(unittest.TestCase):
         self.assertEqual(c.generate("s", "t", ["m"], 4)[0], "ok")
         self.assertEqual([k for _, k in c.calls], ["k1", "k2"])
 
+    def test_402_disables_key_and_moves_on(self) -> None:
+        c = ScriptedClient({"k1": (0, 402, {"error": {"message": "Your prepayment credits are depleted"}}),
+                            "k2": (0, 200, ok("ok"))})
+        self.assertEqual(c.generate("s", "t", ["m"], 4)[0], "ok")
+        self.assertEqual(c.generate("s", "t", ["m"], 4)[0], "ok")
+        self.assertEqual([k for _, k in c.calls], ["k1", "k2", "k2"])  # k1 not retried
+
     def test_404_moves_to_next_model(self) -> None:
         def answer(model):
             if model == "old":

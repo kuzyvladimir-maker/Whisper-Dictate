@@ -298,6 +298,13 @@ class GeminiTextClient:
             self._missing_models.add(att.model)
             self._log(f"gemini {att.model}: unavailable ({status}), next model")
             return "retry", f"{status} {message[:80]}"
+        if status == 402:
+            # "Prepayment credits are depleted": the key's project is out of credit for every
+            # model. Disable the key and go on (it used to be fatal, and round-robin stayed on it).
+            self._banned[att.idx] = time.monotonic() + 6 * 3600
+            self._round_robin = (att.idx + 1) % len(self.keys)
+            self._log(f"gemini key#{att.idx + 1}: 402 (project out of credit), disabled for 6h")
+            return "retry", "402 out of credit"
         if status in (401, 403) or (status == 400 and "api key" in message.lower()):
             self._banned[att.idx] = time.monotonic() + 6 * 3600
             self._log(f"gemini key#{att.idx + 1}: rejected ({status}), disabled for 6h")

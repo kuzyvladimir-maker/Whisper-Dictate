@@ -6,6 +6,7 @@ final class SelftestURLProtocol: URLProtocol {
     static var started: [String] = []
     static var cancelled = 0
     static var firstFails = false
+    static var failStatus = 429
     private var work: DispatchWorkItem?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -16,11 +17,13 @@ final class SelftestURLProtocol: URLProtocol {
         Self.started.append(key)
         let fails = Self.firstFails && key == "test-A"
         Self.lock.unlock()
-        // B wins, or succeeds after A's early rate limit. A must be cancelled on B's win.
-        let delay = key == "test-A" ? (fails ? 0.01 : 2.0) : 0.08
+        // A is slow (no answer for 4 s) and B, raced at once on another key, answers fast;
+        // or A fails at once (429 / 402) and B takes over. A must be cancelled on B's win.
+        let delay = key == "test-A" ? (fails ? 0.01 : 4.0) : 0.08
+        let status = fails ? Self.failStatus : 200
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            let response = HTTPURLResponse(url: self.request.url!, statusCode: fails ? 429 : 200,
+            let response = HTTPURLResponse(url: self.request.url!, statusCode: status,
                                            httpVersion: "HTTP/1.1", headerFields: nil)!
             let body = fails ? "{\"error\":{\"message\":\"quota\"}}" :
                 "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"test answer\"}]},\"finishReason\":\"STOP\"}]}"
@@ -38,8 +41,8 @@ final class SelftestURLProtocol: URLProtocol {
 
     static func run() -> [(String, Bool)] {
         var checks: [(String, Bool)] = []
-        for fails in [false, true] {
-            lock.lock(); started = []; cancelled = 0; firstFails = fails; lock.unlock()
+        for (fails, status) in [(false, 200), (true, 429), (true, 402)] {
+            lock.lock(); started = []; cancelled = 0; firstFails = fails; failStatus = status; lock.unlock()
             let cfg = URLSessionConfiguration.ephemeral
             cfg.protocolClasses = [SelftestURLProtocol.self]
             let client = GeminiClient(configuration: cfg)
@@ -52,7 +55,7 @@ final class SelftestURLProtocol: URLProtocol {
                 if case .success(let r) = $0 { result = r }
                 done.signal()
             }
-            let completed = done.wait(timeout: .now() + 3) == .success
+            let completed = done.wait(timeout: .now() + 6) == .success
             let elapsed = Date().timeIntervalSince(t)
             // URLSession cancellation is asynchronous; bound the wait rather than relying
             // on ordering between completion and stopLoading().
@@ -64,10 +67,15 @@ final class SelftestURLProtocol: URLProtocol {
                 }
             }
             lock.lock(); let sent = started; let stopped = cancelled; lock.unlock()
-            checks.append((fails ? "race survives 429" : "immediate two-key race",
-                           completed && result?.keyIndex == 1 && result?.attempts == 2
-                           && Set(sent) == Set(["test-A", "test-B"]) && sent.count == 2 && elapsed < 1))
-            if !fails { checks.append(("loser cancelled", stopped > 0)) }
+            let ok = completed && result?.keyIndex == 1 && result?.attempts == 2
+                && Set(sent) == Set(["test-A", "test-B"]) && sent.count == 2
+            if !fails {
+                // Second request goes out at once on another key; B wins long before A's 4 s.
+                checks.append((String(format: "immediate two-key race (%.2fs)", elapsed), ok && elapsed < 1))
+                checks.append(("loser cancelled", stopped > 0))
+            } else {
+                checks.append(("\(status) on one key -> next key", ok && elapsed < 1))
+            }
             checks.append(("duplicate keys removed", client.keyCount == 2))
         }
         return checks

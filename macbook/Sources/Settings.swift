@@ -88,7 +88,11 @@ final class Settings {
     var model = Settings.defaultModel           // fallback in every mode
     var fastModel = Settings.defaultFastModel   // primary in every mode
     var longAudioSeconds = 20.0
-    var fallbackModels: [String] = []
+    // Other serving pools for the staggered hedge: when flash-lite's pool is slow (18.11: 5-20 s,
+    // ~35% hung), a different model on another key usually answers. 3-flash-preview was the most
+    // reliable in the 18.11 A/B; a 404 later (preview retired) just skips it.
+    static let defaultFallbacks = ["gemini-3-flash-preview", "gemini-3.1-flash-lite"]
+    var fallbackModels: [String] = Settings.defaultFallbacks
     var language = "ru"
     var audioFormat = "aac"   // "aac" (smaller upload) or "wav"
     var whisperCli = ""
@@ -102,9 +106,11 @@ final class Settings {
     func models(mode: DictationMode, seconds: Double) -> [String] {
         // Race two fast-model keys in every mode; prompts still select normal/email/code.
         // Quality model is only a fallback, so no heavy-model delay precedes the race.
-        var chain = [fastModel, model]
+        // Fast model first in every mode (prompts still differ per mode), then the other pools
+        // for hedging/retries, the heavy model (20/day free, often 402/hung) last.
+        var chain = [fastModel]
         chain += fallbackModels
-        chain += [Settings.defaultFastModel, Settings.defaultModel]
+        chain += [Settings.defaultFastModel] + Settings.defaultFallbacks + [model, Settings.defaultModel]
         var out: [String] = []
         for m in chain where !m.isEmpty && !Settings.isRetired(m) && !out.contains(m) { out.append(m) }
         return out

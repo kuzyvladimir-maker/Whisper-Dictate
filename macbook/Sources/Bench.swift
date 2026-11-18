@@ -17,6 +17,7 @@ enum CLI {
         var cold = false
         var useLocal = false
         var format = Settings.shared.audioFormat
+        var opts = BenchOptions()
         var command = ""
         var i = 0
         while i < args.count {
@@ -34,6 +35,18 @@ enum CLI {
             case "--format":
                 i += 1
                 if i < args.count { format = args[i] }
+            case "--no-hedge": opts.hedge = false
+            case "--no-dict": opts.dictionary = false
+            case "--quiet": opts.quiet = true
+            case "--thinking":
+                i += 1
+                if i < args.count { opts.thinking = args[i] }
+            case "--repeat":
+                i += 1
+                if i < args.count, let n = Int(args[i]) { opts.repeats = max(1, n) }
+            case "--pause":
+                i += 1
+                if i < args.count, let p = Double(args[i]) { opts.pause = max(0, p) }
             default: files.append(a)
             }
             i += 1
@@ -43,7 +56,7 @@ enum CLI {
         case "--mic-test": return micTest()
         case "--list-models": return listModels()
         case "--bench" where useLocal: return benchLocal(files: files)
-        case "--bench": return bench(files: files, models: models, mode: mode, cold: cold, format: format)
+        case "--bench": return bench(files: files, models: models, mode: mode, cold: cold, format: format, opts: opts)
         default:
             print("usage: WhisperDictateLite --bench [--model M] [--mode normal|email|code] [--cold] file...")
             print("       WhisperDictateLite --list-models | --selftest")
@@ -73,15 +86,30 @@ enum CLI {
         return 0
     }
 
+    struct BenchOptions {
+        var hedge = true
+        var dictionary = true
+        var thinking: String?
+        var repeats = 1
+        var pause = 1.0
+        var quiet = false
+    }
+
     private static func bench(files: [String], models: [String], mode: DictationMode, cold: Bool,
-                              format: String) -> Int32 {
+                              format: String, opts: BenchOptions = BenchOptions()) -> Int32 {
         guard let c = client() else { return 2 }
+        c.hedgeEnabled = opts.hedge
+        c.thinkingOverride = opts.thinking
+        c.timing.onTiming = { line in print("   · " + line) }
         UserDictionary.shared.refresh()
-        let system = Prompts.system(mode: mode, dictionary: UserDictionary.shared.entries(for: nil))
+        let dict = opts.dictionary ? UserDictionary.shared.entries(for: nil) : []
+        let system = Prompts.system(mode: mode, dictionary: dict)
+        print("hedge=\(opts.hedge) dictionary=\(dict.count) terms thinking=\(opts.thinking ?? "default") repeats=\(opts.repeats)")
+        var failures = 0
         let route = models.isEmpty ? "auto (\(Settings.shared.fastModel) во всех режимах; \(Settings.shared.model) запасная)" : models.joined(separator: ",")
         print("arch=\(machineArch()) keys=\(c.keyCount) models=\(route) mode=\(mode.rawValue) format=\(format) warm=\(!cold)")
         var totals: [Double] = []
-        for path in files {
+        for path in files.flatMap({ Array(repeating: $0, count: opts.repeats) }) {
             let url = URL(fileURLWithPath: path)
             let samples: [Int16]
             do { samples = try Audio.load(url) } catch {
@@ -111,19 +139,25 @@ enum CLI {
                                   url.lastPathComponent, seconds, upload.mime, upload.data.count / 1024, dt, res.model,
                                   res.keyIndex + 1, res.attempts)
                 case .failure(let e):
+                    failures += 1
                     line = String(format: "%@\taudio %.1fs\tFAILED after %.2fs: %@", url.lastPathComponent,
                                   seconds, dt, e.localizedDescription)
                 }
                 done.signal()
             }
             done.wait()
+            Thread.sleep(forTimeInterval: 0.2)   // let the timing delegate report
             print(line)
-            if !text.isEmpty { print("   " + text.replacingOccurrences(of: "\n", with: "\n   ")) }
+            if !text.isEmpty && !opts.quiet { print("   " + text.replacingOccurrences(of: "\n", with: "\n   ")) }
+            if opts.pause > 0 { Thread.sleep(forTimeInterval: opts.pause) }
         }
         if !totals.isEmpty {
             let sorted = totals.sorted()
-            print(String(format: "release→text: median %.2fs, min %.2fs, max %.2fs (n=%d)",
-                         sorted[sorted.count / 2], sorted.first!, sorted.last!, sorted.count))
+            let p90 = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.9))]
+            print(String(format: "release→text: ok %d, failed %d; median %.2fs, p90 %.2fs, min %.2fs, max %.2fs",
+                         sorted.count, failures, sorted[sorted.count / 2], p90, sorted.first!, sorted.last!))
+        } else {
+            print("release→text: ok 0, failed \(failures)")
         }
         return 0
     }

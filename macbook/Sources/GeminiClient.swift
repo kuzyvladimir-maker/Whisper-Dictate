@@ -42,8 +42,35 @@ enum GeminiError: Error, LocalizedError {
     }
 }
 
+/// Splits one request into upload / server wait / download using URLSessionTaskMetrics,
+/// so "slow" can be attributed to the network or to Gemini instead of guessed.
+final class RequestTiming: NSObject, URLSessionTaskDelegate {
+    var onTiming: ((String) -> Void)?
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        guard let t = metrics.transactionMetrics.last, let reqStart = t.requestStartDate,
+              let reqEnd = t.requestEndDate, let respStart = t.responseStartDate,
+              let respEnd = t.responseEndDate else { return }
+        var connect = ""
+        if !t.isReusedConnection, let cs = t.connectStartDate, let ce = t.connectEndDate {
+            connect = String(format: " connect %.2fs", ce.timeIntervalSince(cs))
+        }
+        let kb = Double(task.countOfBytesSent) / 1024
+        let line = String(format: "gemini timing %@: upload %.2fs (%.0f KB) wait %.2fs download %.2fs total %.2fs %@%@",
+                          task.taskDescription ?? "-", reqEnd.timeIntervalSince(reqStart), kb,
+                          respStart.timeIntervalSince(reqEnd), respEnd.timeIntervalSince(respStart),
+                          metrics.taskInterval.duration, t.isReusedConnection ? "reused" : "new", connect)
+        Log.write(line)
+        onTiming?(line)
+    }
+}
+
 final class GeminiClient {
     private let session: URLSession
+    let timing = RequestTiming()
+    /// A/B knobs for --bench (the app keeps the defaults).
+    var hedgeEnabled = true
+    var thinkingOverride: String?   // "none" | "minimal" | "low" | "budget0"
     private let q = DispatchQueue(label: "gemini")
     private var keys: [String] = []
     private var roundRobin = 0
@@ -62,7 +89,7 @@ final class GeminiClient {
         cfg.waitsForConnectivity = false
         cfg.urlCache = nil
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        session = URLSession(configuration: cfg)
+        session = URLSession(configuration: cfg, delegate: timing, delegateQueue: nil)
     }
 
     var keyCount: Int { q.sync { keys.count } }
@@ -125,15 +152,18 @@ final class GeminiClient {
         var inFlight = 0
         var done = false
         var hedgeScheduled = false
-        var busy: (model: String, idx: Int)?
+        var running: [(model: String, idx: Int)] = []
         var tasks: [URLSessionDataTask] = []
-        // When flash-lite leads (the common case) it answers in bursts of 1.9-8 s, so we fire a
-        // second request on another key right away and take whichever answers first. For the
-        // heavy model (short email/code) we wait, so a duplicate does not burn its 20/day.
-        var hedgeDelay: Double {
-            let primaryCheap = models.first?.contains("lite") ?? false
-            return primaryCheap ? 0 : (1.0 + audioSeconds * 0.02)
-        }
+        // Racing (18.11 A/B, same WAVs interleaved): Gemini latency is bimodal (~1.5 s or ~7 s)
+        // and independent per request, and ~35% of requests hung with no answer at all.
+        //  #2 at once: same fast model, another key — two tickets for the fast mode (best median);
+        //  #3 after `hedgeTimes[1]`: another model (other serving pool) — caps the tail when the
+        //     whole flash-lite pool is slow. First good answer wins, the rest are cancelled.
+        var hedgeTimes: [Double] { [0, 2.5 + audioSeconds * 0.03] }
+        var hedgesDone = 0
+        /// Hard cap for the whole dictation; after it the recording stays for "Повторить".
+        var deadline: Double { min(30, 12 + audioSeconds * 0.25) }
+        var remaining: Double { deadline - Date().timeIntervalSince(started) }
 
         func complete(_ result: Result<GeminiResult, GeminiError>) {
             guard !done else { return }
@@ -157,7 +187,7 @@ final class GeminiClient {
             complete(.failure(error))
         }
 
-        private func pick(from list: [String], avoidKey: Int?) -> (String, Int)? {
+        private func pick(from list: [String], avoidKey: Int?, avoidKeys: Set<Int> = []) -> (String, Int)? {
             let c = client
             let n = c.keys.count
             let now = Date()
@@ -165,7 +195,7 @@ final class GeminiClient {
                 for off in 0..<n {
                     let idx = (c.roundRobin + off) % n
                     let id = "\(model)#\(idx)"
-                    if idx == avoidKey || tried.contains(id) { continue }
+                    if idx == avoidKey || avoidKeys.contains(idx) || tried.contains(id) { continue }
                     if let until = c.keyBanned[idx], until > now { continue }
                     if let until = c.cooldown[id], until > now { continue }
                     return (model, idx)
@@ -177,27 +207,44 @@ final class GeminiClient {
         private func launch(_ model: String, _ idx: Int) {
             tried.insert("\(model)#\(idx)")
             attempts += 1
-            busy = (model, idx)
-            client.send(model: model, keyIndex: idx, job: self)
+            running.append((model, idx))
+            client.send(model: model, keyIndex: idx, job: self, timeout: max(1, remaining))
             if !hedgeScheduled {
                 hedgeScheduled = true
-                if hedgeDelay == 0 {
-                    hedge()
-                } else {
-                    client.q.asyncAfter(deadline: .now() + hedgeDelay) { [self] in self.hedge() }
+                client.q.asyncAfter(deadline: .now() + deadline) { [self] in
+                    guard !self.done else { return }
+                    Log.write("gemini: no answer within \(fmt(self.deadline))s (\(self.attempts) requests), giving up")
+                    self.complete(.failure(.network("Gemini не ответил за \(Int(self.deadline)) с")))
+                }
+                if client.hedgeEnabled {
+                    for t in hedgeTimes where t < deadline - 1 {
+                        if t == 0 { hedge() } else {
+                            client.q.asyncAfter(deadline: .now() + t) { [self] in self.hedge() }
+                        }
+                    }
                 }
             }
         }
 
+        /// Extra request on a model and key that are not already running. Cheap models first;
+        /// the quality model (3.6-flash, 20/day) is never used for a duplicate.
         private func hedge() {
-            guard !done, inFlight == 1, let b = busy else { return }
-            // Second request on the cheap model (flash-lite: 500/day free) with another key —
-            // never burn the quality model's 20/day on a duplicate. The first good answer wins
-            // and the loser is cancelled in complete().
-            let cheap = models.first(where: { $0.contains("lite") })
-            guard let (model, idx) = (cheap.flatMap { pick(from: [$0], avoidKey: b.idx) }) else { return }
-            Log.write("gemini: second request on \(model) key#\(idx + 1)")
-            launch(model, idx)
+            guard !done, inFlight > 0, inFlight < 3, remaining > 2 else { return }
+            let busyModels = Set(running.map { $0.model })
+            let busyKeys = Set(running.map { $0.idx })
+            let quality = Settings.shared.model
+            let same = models.filter { busyModels.contains($0) && $0 != quality }
+            let other = models.filter { !busyModels.contains($0) && $0 != quality }
+            hedgesDone += 1
+            // First extra request: same model, another key. Later ones: another model first.
+            let candidates = hedgesDone == 1 ? same + other : other + same
+            for model in candidates {
+                if let (m, idx) = pick(from: [model], avoidKey: nil, avoidKeys: busyKeys) {
+                    Log.write("gemini: no answer yet, extra request on \(m) key#\(idx + 1)")
+                    launch(m, idx)
+                    return
+                }
+            }
         }
 
         init(client: GeminiClient, b64: String, mimeType: String, audioSeconds: Double, system: String, user: String,
@@ -214,6 +261,10 @@ final class GeminiClient {
 
         func next() {
             guard !done else { return }
+            if remaining < 1 {
+                complete(.failure(lastError))
+                return
+            }
             let c = client
             let now = Date()
             if let (model, idx) = pick(from: models, avoidKey: nil) {
@@ -252,6 +303,13 @@ final class GeminiClient {
     }
 
     private func thinkingConfig(for model: String) -> [String: Any]? {
+        switch thinkingOverride {
+        case "none"?: return nil
+        case "minimal"?: return ["thinkingLevel": "minimal"]
+        case "low"?: return ["thinkingLevel": "low"]
+        case "budget0"?: return ["thinkingBudget": 0]
+        default: break
+        }
         if noThinkingConfig.contains(model) { return nil }
         if model.hasPrefix("gemini-2.5-pro") || model.contains("-pro") { return nil }
         if model.hasPrefix("gemini-2.5") { return ["thinkingBudget": 0] }
@@ -280,7 +338,7 @@ final class GeminiClient {
         return try? JSONSerialization.data(withJSONObject: obj, options: [.withoutEscapingSlashes])
     }
 
-    private func send(model: String, keyIndex: Int, job: Job) {
+    private func send(model: String, keyIndex: Int, job: Job, timeout: Double) {
         guard let url = URL(string: "\(host)/v1beta/models/\(model):generateContent"),
               let payload = body(model: model, job: job) else {
             job.fail(.http(0, "bad request"))
@@ -293,7 +351,7 @@ final class GeminiClient {
         req.setValue(keys[keyIndex], forHTTPHeaderField: "x-goog-api-key")
         // Не ждём один ответ слишком долго: длинная запись не должна висеть минуту —
         // hedge на flash-lite и перебор пар подхватят раньше. Потолок 30 с.
-        req.timeoutInterval = min(30, 12 + job.audioSeconds * 0.3)
+        req.timeoutInterval = timeout   // never longer than what is left of the job deadline
         req.httpBody = payload
         let t0 = Date()
         let task = session.dataTask(with: req) { data, response, error in
@@ -303,6 +361,7 @@ final class GeminiClient {
                             response: response as? HTTPURLResponse, error: error, seconds: dt)
             }
         }
+        task.taskDescription = "\(model) key#\(keyIndex + 1)"
         job.tasks.append(task)   // retained so the losing duplicate can be cancelled
         task.resume()
     }
@@ -311,7 +370,10 @@ final class GeminiClient {
                         error: Error?, seconds: Double) {
         let tag = "\(model) key#\(keyIndex + 1)"
         job.inFlight -= 1
-        if job.done { return }   // the other (hedged) request already won
+        if let i = job.running.firstIndex(where: { $0.model == model && $0.idx == keyIndex }) {
+            job.running.remove(at: i)
+        }
+        if job.done { return }   // another (hedged) request already won, or the deadline passed
         if let error = error {
             let code = (error as NSError).code
             Log.write("gemini \(tag): network error \(code) after \(fmt(seconds))s")
@@ -365,6 +427,16 @@ final class GeminiClient {
             missingModels.insert(model)
             Log.write("gemini \(model): unavailable (\(status) \(message.prefix(100))), next model")
             job.lastError = .http(status, message)
+            job.retryOrWait()
+        case 402:
+            // "Prepayment credits are depleted": the key's project is out of credit for every
+            // model. Before 18.11 this fell into `default:` (fatal) and round-robin stayed on
+            // that key, so every following dictation failed in 0.2 s until a restart
+            // (MacBook log 17.11: 19x402, 21 failed dictations). Disable the key, go on.
+            keyBanned[keyIndex] = Date().addingTimeInterval(6 * 3600)
+            roundRobin = (keyIndex + 1) % max(keys.count, 1)
+            Log.write("gemini key#\(keyIndex + 1): 402 (project out of credit), disabled for 6h")
+            job.lastError = .badKeys
             job.retryOrWait()
         case 400 where message.contains("API key") || message.contains("API_KEY"),
              401, 403:
