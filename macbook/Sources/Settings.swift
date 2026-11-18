@@ -52,6 +52,9 @@ enum Paths {
     static let dictionaryFile = configDir.appendingPathComponent("dictionary.txt")
     static let localDir = home.appendingPathComponent(".local/share/whisper-dictate", isDirectory: true)
     static let logFile = home.appendingPathComponent("Library/Logs/WhisperDictateLite.log")
+    // Last recordings kept on disk for "Повторить отправку": outside the repo and outside iCloud.
+    static let recordingsDir = home.appendingPathComponent(
+        "Library/Application Support/WhisperDictateLite/recordings", isDirectory: true)
 }
 
 final class Settings {
@@ -69,6 +72,14 @@ final class Settings {
     var restoreClipboard = true
     var restoreDelay = 0.8
     var holdThreshold = 0.35
+    // Keep capturing this long after the key is released so the last word is not clipped
+    // (Bluetooth mics like AirPods deliver audio with a delay). Esc still cancels at once.
+    var tailSeconds = 0.4
+    // Rolling buffer kept while the mic is already open; prepended at the start of the next
+    // recording so the first 0.3-0.6 s is not lost between key-down and capture start.
+    var preRollSeconds = 0.6
+    // How many recent recordings to keep on disk for "Повторить отправку".
+    var recordingsKept = 20
     var maxRecordingSeconds = 600.0
     // Free tier (Nov 2026): 3.6-flash 5/min, 20/day per project; 3.5-flash-lite 15/min, 500/day.
     // flash-lite carries everyday short phrases AND long dictations (3.6-flash stalls on long
@@ -125,6 +136,9 @@ final class Settings {
         if let v = obj["restore_clipboard"] as? Bool { restoreClipboard = v }
         if let v = obj["restore_delay_seconds"] as? Double { restoreDelay = v }
         if let v = obj["hold_threshold_seconds"] as? Double { holdThreshold = v }
+        if let v = obj["tail_seconds"] as? Double { tailSeconds = max(0, min(2, v)) }
+        if let v = obj["pre_roll_seconds"] as? Double { preRollSeconds = max(0, min(2, v)) }
+        if let v = obj["recordings_kept"] as? Int { recordingsKept = max(0, min(200, v)) }
         if let v = obj["max_recording_seconds"] as? Double { maxRecordingSeconds = v }
         if let v = obj["model"] as? String, !v.isEmpty, !Settings.isRetired(v) { model = v }
         if let v = obj["fast_model"] as? String, !v.isEmpty, !Settings.isRetired(v) { fastModel = v }
@@ -150,6 +164,9 @@ final class Settings {
             "restore_clipboard": restoreClipboard,
             "restore_delay_seconds": restoreDelay,
             "hold_threshold_seconds": holdThreshold,
+            "tail_seconds": tailSeconds,
+            "pre_roll_seconds": preRollSeconds,
+            "recordings_kept": recordingsKept,
             "max_recording_seconds": maxRecordingSeconds,
             "model": model,
             "fast_model": fastModel,

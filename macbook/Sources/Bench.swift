@@ -240,6 +240,17 @@ enum CLI {
         check("whisper hallucination filter", LocalWhisper.isHallucination("Продолжение следует...")
               && !LocalWhisper.isHallucination("Спасибо за просмотр, давай теперь обсудим цену и сроки поставки для Walmart"))
 
+        // RecordingStore: keeps the newest N on disk, latest() returns the newest.
+        let recDir = FileManager.default.temporaryDirectory.appendingPathComponent("wdl-rec-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: recDir) }
+        let clip = [Int16](repeating: 100, count: 1600)
+        for i in 1...5 { _ = RecordingStore.save(clip, keep: 3, in: recDir, name: String(format: "2026-%02d", i)) }
+        let kept = ((try? FileManager.default.contentsOfDirectory(at: recDir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "wav" }
+        check("recordings prune keeps N", kept.count == 3, "осталось \(kept.count)")
+        check("recordings latest is newest", RecordingStore.latest(in: recDir)?.lastPathComponent == "rec-2026-05.wav",
+              RecordingStore.latest(in: recDir)?.lastPathComponent ?? "nil")
+
         let keys = Env.loadKeys()
         check("gemini keys", !keys.isEmpty, keys.isEmpty ? "нет (\(Paths.envFile.path))" : "найдено: \(keys.count)")
         let local = LocalWhisper().locate()

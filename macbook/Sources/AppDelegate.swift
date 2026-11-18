@@ -18,7 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let hotkey = HotkeyMonitor()
     private let audioQueue = DispatchQueue(label: "audio")
 
-    private enum State { case idle, holding, toggled, processing }
+    private enum State { case idle, holding, toggled, finishing, processing }
     private var state: State = .idle
     private var session = 0
     private var pressedAt = Date()
@@ -76,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         gemini.setKeys(Env.loadKeys())
         dictionary.refresh()
         recorder.idleCloseSeconds = settings.micIdleCloseSeconds
+        recorder.preRollSeconds = settings.preRollSeconds
     }
 
     private func ensureHotkey(prompt: Bool) {
@@ -104,7 +105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch state {
         case .idle: startRecording()
         case .toggled: finishRecording()
-        case .holding, .processing: break
+        case .holding, .finishing, .processing: break
         }
     }
 
@@ -128,7 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func keyPressed(_ code: Int64) -> Bool {
         guard code == 53 else { return false }  // Esc
-        if isRecording {
+        if isRecording || state == .finishing {
             cancelRecording(silent: false)
             return true
         }
@@ -193,10 +194,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func finishRecording() {
         guard isRecording else { return }
-        state = .processing
+        let released = Date()
         stopTick()
         hearing.stop()
-        let released = Date()
+        let tail = settings.tailSeconds
+        if tail <= 0 {
+            stopAndProcess(released: released)
+            return
+        }
+        // Keep the mic capturing a little longer so a clipped ending (common on AirPods, which
+        // deliver audio with a delay) still makes it in. Esc during this window cancels.
+        state = .finishing
+        updateIcon()
+        Log.write("tail \(fmt(tail))s")
+        let my = session
+        DispatchQueue.main.asyncAfter(deadline: .now() + tail) {
+            guard my == self.session, self.state == .finishing else { return }
+            self.stopAndProcess(released: released)
+        }
+    }
+
+    private func stopAndProcess(released: Date) {
+        state = .processing
         play("stop")
         updateIcon()
         let my = session
@@ -211,7 +230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func cancelRecording(silent: Bool) {
-        guard isRecording else { return }
+        guard isRecording || state == .finishing else { return }
         Log.write("recording cancelled\(silent ? " (combo)" : " (Esc)")")
         session += 1
         state = .idle
@@ -246,6 +265,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         processingSince = Date()
         pendingAudio = samples
         updateIcon()
+        // Persist to disk before the network call so a crash or restart never loses the dictation.
+        let keep = settings.recordingsKept
+        audioQueue.async { RecordingStore.save(samples, keep: keep) }
         let token = session
         let mode = settings.mode
 
@@ -273,7 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 case .success(let r):
                     let engine = r.attempts > 1 ? "\(r.model), попыток \(r.attempts)" : r.model
                     self.deliver(Prompts.clean(r.text, mode: mode), mode: mode, released: released,
-                                 seconds: seconds, engine: engine)
+                                 seconds: seconds, engine: engine, key: r.keyIndex, requests: r.attempts)
                 case .failure(let e):
                     Log.write("gemini failed: \(e.localizedDescription)")
                     if e.allowsLocalFallback && self.settings.localFallback && self.local.isAvailable {
@@ -305,7 +327,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func deliver(_ text: String, mode: DictationMode, released: Date, seconds: Double, engine: String) {
+    private func deliver(_ text: String, mode: DictationMode, released: Date, seconds: Double, engine: String,
+                         key: Int? = nil, requests: Int? = nil) {
         state = .idle
         pendingAudio = nil
         failedAudio = nil
@@ -326,7 +349,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let latency = Date().timeIntervalSince(released)
         lastInfo = String(format: "%.1f с после отпускания · %@ · запись %.0f с", latency, engine, seconds)
-        Log.write("done: audio=\(fmt(seconds))s release->paste=\(fmt(latency))s engine=\(engine) chars=\(out.count)")
+        let winner = key.map { " key#\($0 + 1)" } ?? ""
+        let reqs = requests.map { " requests=\($0)" } ?? ""
+        Log.write("done: audio=\(fmt(seconds))s release->paste=\(fmt(latency))s engine=\(engine)\(winner)\(reqs) "
+                  + "chars=\(out.count)")
         updateIcon()
     }
 
@@ -405,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch state {
         case .idle:
             if needsAttention { symbol = "exclamationmark.triangle"; fallback = "⚠️" }
-        case .holding, .toggled:
+        case .holding, .toggled, .finishing:
             symbol = "mic.fill"
             fallback = "🔴"
             tint = .systemRed
@@ -436,6 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .idle: status = "Готов · держите \(settings.hotkey.title)"
         case .holding: status = "Запись… отпустите клавишу, чтобы вставить"
         case .toggled: status = "Запись… нажмите клавишу ещё раз (Esc — отмена)"
+        case .finishing: status = "Дописываю окончание… (Esc — отмена)"
         case .processing: status = "Распознаю… (Esc — прервать)"
         }
         menu.addItem(info(status))
@@ -483,7 +510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(soundItem)
 
         menu.addItem(.separator())
-        if failedAudio != nil {
+        if failedAudio != nil || RecordingStore.hasAny() {
             menu.addItem(item("Повторить отправку последней записи", #selector(retryFailed)))
         }
         if lastText != nil {
@@ -495,6 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(item("Словарь для «\(name)»…", #selector(openAppDictionary)))
         }
         menu.addItem(item("Папка настроек…", #selector(openConfigDir)))
+        menu.addItem(item("Папка записей…", #selector(openRecordings)))
         menu.addItem(item("Перечитать ключи и словарь", #selector(reloadAll)))
         menu.addItem(item("Журнал…", #selector(openLog)))
         menu.addItem(.separator())
@@ -552,10 +580,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func retryFailed() {
-        guard state == .idle, let samples = failedAudio else { return }
+        guard state == .idle else { return }
+        // Prefer the in-memory failure; fall back to the newest recording on disk (survives a restart).
+        var samples = failedAudio
+        if samples == nil, let url = RecordingStore.latest() {
+            samples = try? Audio.load(url)
+            if samples == nil { Log.write("retry: can't read \(url.lastPathComponent)") }
+        }
+        guard let audio = samples, !audio.isEmpty else { return }
         session += 1
         state = .processing
-        process(samples: samples, peak: Audio.peak(samples), released: Date())
+        process(samples: audio, peak: Audio.peak(audio), released: Date())
+    }
+
+    @objc private func openRecordings() {
+        try? FileManager.default.createDirectory(at: Paths.recordingsDir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        NSWorkspace.shared.open(Paths.recordingsDir)
     }
 
     @objc private func copyLast() {

@@ -124,11 +124,21 @@ final class GeminiClient {
         var done = false
         var hedgeScheduled = false
         var busy: (model: String, idx: Int)?
-        var hedgeAfter: Double { 1.0 + audioSeconds * 0.02 }
+        var tasks: [URLSessionDataTask] = []
+        // When flash-lite leads (the common case) it answers in bursts of 1.9-8 s, so we fire a
+        // second request on another key right away and take whichever answers first. For the
+        // heavy model (short email/code) we wait, so a duplicate does not burn its 20/day.
+        var hedgeDelay: Double {
+            let primaryCheap = models.first?.contains("lite") ?? false
+            return primaryCheap ? 0.05 : (1.0 + audioSeconds * 0.02)
+        }
 
         func complete(_ result: Result<GeminiResult, GeminiError>) {
             guard !done else { return }
             done = true
+            // Winner chosen: cancel the still-running duplicate so it does not linger on the network.
+            for t in tasks where t.state == .running || t.state == .suspended { t.cancel() }
+            tasks.removeAll()
             completion(result)
         }
 
@@ -169,17 +179,18 @@ final class GeminiClient {
             client.send(model: model, keyIndex: idx, job: self)
             if !hedgeScheduled {
                 hedgeScheduled = true
-                client.q.asyncAfter(deadline: .now() + hedgeAfter) { [self] in self.hedge() }
+                client.q.asyncAfter(deadline: .now() + hedgeDelay) { [self] in self.hedge() }
             }
         }
 
         private func hedge() {
             guard !done, inFlight == 1, let b = busy else { return }
-            // Hedge on the cheap model (flash-lite: 500/day free) — never burn the
-            // quality model's 20/day on a duplicate.
+            // Second request on the cheap model (flash-lite: 500/day free) with another key —
+            // never burn the quality model's 20/day on a duplicate. The first good answer wins
+            // and the loser is cancelled in complete().
             let cheap = models.first(where: { $0.contains("lite") })
             guard let (model, idx) = (cheap.flatMap { pick(from: [$0], avoidKey: b.idx) }) else { return }
-            Log.write("gemini: no answer after \(fmt(hedgeAfter))s, hedging on \(model) key#\(idx + 1)")
+            Log.write("gemini: second request on \(model) key#\(idx + 1)")
             launch(model, idx)
         }
 
@@ -279,13 +290,15 @@ final class GeminiClient {
         req.timeoutInterval = min(30, 12 + job.audioSeconds * 0.3)
         req.httpBody = payload
         let t0 = Date()
-        session.dataTask(with: req) { data, response, error in
+        let task = session.dataTask(with: req) { data, response, error in
             self.q.async {
                 let dt = Date().timeIntervalSince(t0)
                 self.handle(model: model, keyIndex: keyIndex, job: job, data: data,
                             response: response as? HTTPURLResponse, error: error, seconds: dt)
             }
-        }.resume()
+        }
+        job.tasks.append(task)   // retained so the losing duplicate can be cancelled
+        task.resume()
     }
 
     private func handle(model: String, keyIndex: Int, job: Job, data: Data?, response: HTTPURLResponse?,

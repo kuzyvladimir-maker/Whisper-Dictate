@@ -71,9 +71,14 @@ main() {
   rm -rf "$app"
   ditto "$build_out" "$app"
   rm -rf "$(dirname "$build_out")"
-  if [ "$upgrading" = 1 ]; then
-    # Новая подпись: старое разрешение «Универсальный доступ» больше не действует, сбрасываем,
-    # чтобы macOS спросила заново (иначе галочка стоит, но не работает).
+  # Устойчивая self-signed identity даёт стабильную подпись → разрешения переживают обновление,
+  # сбрасывать их НЕ нужно. Без неё (ad-hoc) подпись каждый раз новая, поэтому сбрасываем, чтобы
+  # macOS спросила заново (иначе галочка стоит, но не работает).
+  local stable_sign=0
+  if security find-identity -v -p codesigning 2>/dev/null | grep -q "Whisper Dictate Lite Self-Signed"; then
+    stable_sign=1
+  fi
+  if [ "$upgrading" = 1 ] && [ "$stable_sign" = 0 ]; then
     tccutil reset Accessibility "$bundle_id" >/dev/null 2>&1 || true
     tccutil reset Microphone "$bundle_id" >/dev/null 2>&1 || true
   fi
@@ -148,6 +153,13 @@ PLIST
   if [ -n "$fn_note" ]; then say ""; say "$fn_note"; fi
   say ""
   say "Проверка: \"$app/Contents/MacOS/WhisperDictateLite\" --selftest"
+  if [ "$stable_sign" = 0 ]; then
+    say ""
+    say "Совет: чтобы после каждого обновления не выдавать заново «Универсальный доступ» и"
+    say "       «Микрофон», один раз выполните (в обычной сессии, не по SSH):"
+    say "         bash \"$src/make-signing-identity.sh\""
+    say "       Дальше установки будут подписываться устойчиво и разрешения сохранятся."
+  fi
 }
 
 install_local() {

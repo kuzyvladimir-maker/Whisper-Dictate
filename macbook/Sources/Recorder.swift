@@ -29,6 +29,10 @@ final class Recorder {
     private var samples: [Int16] = []
     private var peak: Int16 = 0
     private var capturing = false
+    // Rolling buffer of the most recent audio while the mic is open but we are not yet
+    // capturing. Prepended to the next recording so the first fraction of a second (lost
+    // between key-down and capture start) is not clipped.
+    private var preRoll: [Int16] = []
     private var idleClose: DispatchWorkItem?
     private var configObserver: NSObjectProtocol?
     private let lock = NSLock()
@@ -36,6 +40,8 @@ final class Recorder {
 
     /// Seconds the mic stays open after a dictation (0 = close right away).
     var idleCloseSeconds = 30.0
+    /// Seconds of audio to keep in the pre-roll buffer and prepend to the next recording.
+    var preRollSeconds = 0.6
     /// Smoothed live peak (0...1) and the time of the last audio callback, for the
     /// "тебя не слышно" warning.
     private var level: Float = 0
@@ -48,14 +54,21 @@ final class Recorder {
             idleClose?.cancel()
             idleClose = nil
             lock.lock()
-            samples = []
+            // Prepend whatever the open mic already heard (up to preRollSeconds) so the start
+            // of the phrase is not clipped. Empty when the mic was closed (cold start).
+            let seed = preRoll
+            preRoll = []
+            samples = seed
             samples.reserveCapacity(Int(Recorder.sampleRate) * 30)
-            peak = 0
+            peak = seed.reduce(Int16(0)) { max($0, $1 == Int16.min ? Int16.max : abs($1)) }
             lock.unlock()
             if engine == nil || engine?.isRunning == false {
                 try openEngine()
             }
             lock.lock()
+            if !seed.isEmpty {
+                Log.write("pre-roll \(fmt(Double(seed.count) / Recorder.sampleRate))s prepended")
+            }
             capturing = true
             callbackAt = Date()
             lock.unlock()
@@ -71,6 +84,7 @@ final class Recorder {
             let p = Float(peak) / Float(Int16.max)
             samples = []
             peak = 0
+            preRoll = []   // start the next pre-roll fresh, not with this recording's tail
             lock.unlock()
             scheduleIdleClose()
             return (out, p)
@@ -164,7 +178,18 @@ final class Recorder {
             if a > bufPeak { bufPeak = a }
         }
         level = max(Float(bufPeak) / Float(Int16.max), level * 0.9)
-        guard capturing else { return }
+        guard capturing else {
+            // Not recording yet: keep only the last preRollSeconds so the next start has a
+            // head of audio to prepend.
+            let maxPreRoll = Int(Recorder.sampleRate * preRollSeconds)
+            if maxPreRoll > 0 {
+                preRoll.append(contentsOf: converted)
+                if preRoll.count > maxPreRoll { preRoll.removeFirst(preRoll.count - maxPreRoll) }
+            } else if !preRoll.isEmpty {
+                preRoll.removeAll()
+            }
+            return
+        }
         samples.append(contentsOf: converted)
         if bufPeak > peak { peak = bufPeak }
     }

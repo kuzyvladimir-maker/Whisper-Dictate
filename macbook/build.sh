@@ -12,6 +12,7 @@ MIN_MACOS="${MIN_MACOS:-11.0}"
 VERSION="0.1.0"
 BUNDLE_ID="com.whisperdictate.lite"
 EXE="WhisperDictateLite"
+SIGN_IDENTITY_NAME="Whisper Dictate Lite Self-Signed"
 
 if ! xcrun --find swiftc >/dev/null 2>&1; then
   echo "swiftc не найден. Установите Command Line Tools: xcode-select --install" >&2
@@ -61,5 +62,19 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --sign - --identifier "$BUNDLE_ID" "$OUT" >/dev/null
+# Подпись. Устойчивая self-signed identity (macbook/make-signing-identity.sh) даёт стабильный
+# «designated requirement», поэтому разрешения «Универсальный доступ» и «Микрофон» переживают
+# переустановку. Если её нет — ad-hoc, как раньше (тогда macOS переспросит доступ после обновления).
+SIGN_ID="${WDL_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_ID" ] && security find-identity -v -p codesigning 2>/dev/null \
+     | grep -q "$SIGN_IDENTITY_NAME"; then
+  SIGN_ID="$SIGN_IDENTITY_NAME"
+fi
+if [ -n "$SIGN_ID" ]; then
+  codesign --force --sign "$SIGN_ID" --identifier "$BUNDLE_ID" "$OUT" >/dev/null
+  echo "Подпись: устойчивая identity «$SIGN_ID» (разрешения переживут обновление)."
+else
+  codesign --force --sign - --identifier "$BUNDLE_ID" "$OUT" >/dev/null
+  echo "Подпись: ad-hoc (разрешения слетят при обновлении; см. make-signing-identity.sh)."
+fi
 echo "Готово: $OUT ($(lipo -archs "$OUT/Contents/MacOS/$EXE"))"
